@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp-kde-backend",
+  "version": "1.0.0",
+  "description": "Headless backend for WhatsApp KDE Widget",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@open-wa/wa-automate": "latest",
+    "express": "latest"
+  }
+}

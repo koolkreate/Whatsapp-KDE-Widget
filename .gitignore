@@ -1,0 +1,23 @@
+# Dependency directories
+node_modules/
+backend/node_modules/
+
+# Local session files & credentials (CRITICAL)
+backend/_IGNORE_whatsapp-kde-session/
+backend/whatsapp-kde-session.data.json
+qr.png
+
+# Custom Chrome binary folder
+chrome/
+
+# Debug files & screenshots
+*.log
+*.pid
+*.png
+eval_payload.json
+
+# IDEs & System files
+.vscode/
+.idea/
+.DS_Store
+.antigravity*

@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "org.kde.whatsappquick",
+        "Name": "WhatsApp Quick",
+        "Description": "Send quick messages and check chats without opening the web client",
+        "Icon": "im-whatsapp",
+        "Category": "Utilities",
+        "Version": "1.0",
+        "License": "GPL-3.0+",
+        "Authors": [
+            {
+                "Name": "Antigravity"
+            }
+        ]
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
