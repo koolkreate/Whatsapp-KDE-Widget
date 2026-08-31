@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lesson 0001: Tech Stack & Architecture Overview</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+    <header>
+        <p><em>Lesson 0001 — Tech Stack Series</em></p>
+        <h1>Understanding the Dual-Layer Architecture</h1>
+    </header>
+
+    <main>
+        <section class="card">
+            <h3>Mission Context</h3>
+            <p>You are learning the tech stack behind <strong>WhatsApp KDE Widget</strong> so you can build, debug, and extend KDE desktop apps with local headless web automation.</p>
+        </section>
+
+        <section>
+            <h2>1. The Big Picture: Why Two Layers?</h2>
+            <p>A native KDE Plasma 6 widget runs inside KDE's desktop process (<code>plasmashell</code>). However, WhatsApp does not provide an open public API for personal accounts. To solve this without reverse-engineering encrypted WebSockets, this project uses a <strong>dual-layer architecture</strong>:</p>
+
+            <ul>
+                <li><strong>Frontend (QML / Qt 6)</strong>: Runs natively inside KDE Plasma. Provides fluid desktop UI, dark theme, right-click context menus, and native plasmoid integration.</li>
+                <li><strong>Backend (Node.js + Puppeteer)</strong>: A lightweight local daemon running Chrome in headless mode. It controls WhatsApp Web via DOM manipulation and exposes a clean local REST API on <code>127.0.0.1:8002</code>.</li>
+            </ul>
+        </section>
+
+        <section>
+            <h2>2. The Data Flow Bridge</h2>
+            <p>How do the desktop UI and the Node backend communicate?</p>
+            
+            <pre><code>+----------------------------------+          HTTP / REST          +----------------------------------+
+|   KDE Plasmoid (QML / Qt 6)     |  --------------------->  |   Node.js Server (Express)      |
+|  widget/contents/ui/main.qml     |  <---------------------  |   backend/server.js              |
++----------------------------------+   JSON (localhost:8002)   +----------------------------------+
+                                                                             |
+                                                                   Puppeteer Automation
+                                                                             v
+                                                                   +-------------------+
+                                                                   |  WhatsApp Web     |
+                                                                   |  (Headless Chrome)|
+                                                                   +-------------------+</code></pre>
+
+            <p>The QML frontend uses standard JavaScript <code>XMLHttpRequest</code> objects to send requests to local endpoints like <code>/api/getAllChats</code>, <code>/api/getChatMessages</code>, and <code>/api/sendReaction</code>.</p>
+        </section>
+
+        <section>
+            <h2>3. Interactive Knowledge Check</h2>
+            <p>Test your storage strength on the concepts covered in this lesson:</p>
+
+            <div class="quiz-container">
+                <p><strong>Q1: Why does the widget use a local Node.js + Puppeteer backend instead of communicating directly with WhatsApp from QML?</strong></p>
+                <button class="quiz-option" onclick="checkQ1(0)">QML cannot perform HTTP requests over localhost network.</button>
+                <button class="quiz-option" onclick="checkQ1(1)">Puppeteer drives WhatsApp Web DOM directly in Chrome.</button>
+                <button class="quiz-option" onclick="checkQ1(2)">Node.js replaces KDE Plasmashell as the main desktop UI.</button>
+                <div id="feedback1" class="feedback"></div>
+            </div>
+
+            <div class="quiz-container">
+                <p><strong>Q2: Which protocol and transport mechanism connects the QML frontend to the local backend daemon?</strong></p>
+                <button class="quiz-option" onclick="checkQ2(0)">HTTP REST requests over localhost port 8002 using XMLHttpRequest.</button>
+                <button class="quiz-option" onclick="checkQ2(1)">DBus system IPC channels connecting directly to Chrome process.</button>
+                <button class="quiz-option" onclick="checkQ2(2)">Shared memory buffers written directly into KDE Plasma shell process.</button>
+                <div id="feedback2" class="feedback"></div>
+            </div>
+        </section>
+
+        <section>
+            <h2>Primary Reading & Resources</h2>
+            <p>For deeper understanding of each tier:</p>
+            <ul>
+                <li><a href="https://develop.kde.org/docs/plasma/" target="_blank">KDE Plasma 6 Widget Developer Guide</a></li>
+                <li><a href="https://pptr.dev/" target="_blank">Puppeteer Official Documentation</a></li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <p>💡 <em>Got questions or want to try modifying code? Ask your agent in chat for clarification or the next lesson!</em></p>
+    </footer>
+
+    <script>
+        function checkQ1(choice) {
+            const fb = document.getElementById('feedback1');
+            if (choice === 1) {
+                fb.style.color = '#005c4b';
+                fb.textContent = '✅ Correct! Puppeteer runs Chrome headlessly to automate WhatsApp Web without needing an official API.';
+            } else {
+                fb.style.color = '#c0392b';
+                fb.textContent = '❌ Try again! Think about how WhatsApp Web is loaded and automated.';
+            }
+        }
+
+        function checkQ2(choice) {
+            const fb = document.getElementById('feedback2');
+            if (choice === 0) {
+                fb.style.color = '#005c4b';
+                fb.textContent = '✅ Correct! QML uses standard XMLHttpRequest to query local Express API endpoints at http://127.0.0.1:8002.';
+            } else {
+                fb.style.color = '#c0392b';
+                fb.textContent = '❌ Try again! How does QML exchange JSON data with server.js?';
+            }
+        }
+    </script>
+</body>
+</html>
