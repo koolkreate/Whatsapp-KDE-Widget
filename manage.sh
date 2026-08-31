@@ -10,8 +10,13 @@ WIDGET_ID="org.kde.whatsappquick"
 LOG_FILE="$PROJECT_DIR/backend.log"
 PID_FILE="$PROJECT_DIR/backend.pid"
 
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SERVICE_NAME="whatsapp-backend.service"
+SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME"
+NODE_BIN="$(which node 2>/dev/null || echo "/usr/bin/node")"
+
 function usage() {
-    echo "Usage: $0 {install-widget|uninstall-widget|reinstall-widget|setup-backend|start-backend|stop-backend|status-backend|logs-backend}"
+    echo "Usage: $0 {install-widget|uninstall-widget|reinstall-widget|setup-backend|start-backend|stop-backend|status-backend|logs-backend|enable-autostart|disable-autostart|status-autostart}"
     echo
     echo "Actions:"
     echo "  install-widget      Install the KDE Plasma 6 Widget"
@@ -22,6 +27,9 @@ function usage() {
     echo "  stop-backend        Stop the backend daemon process"
     echo "  status-backend      Check if the backend daemon is running"
     echo "  logs-backend        Tail the backend server log file"
+    echo "  enable-autostart    Configure systemd user service to auto-start backend on boot/login"
+    echo "  disable-autostart   Remove systemd user autostart service"
+    echo "  status-autostart    Check status of systemd user autostart service"
     echo
 }
 
@@ -97,6 +105,46 @@ case "$1" in
         else
             echo "No log file found. Has the backend been started?"
         fi
+        ;;
+    enable-autostart)
+        echo "Configuring systemd user service for WhatsApp backend autostart..."
+        mkdir -p "$SYSTEMD_USER_DIR"
+        cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=WhatsApp KDE Widget Backend Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BACKEND_DIR
+ExecStart=$NODE_BIN server.js
+Restart=always
+RestartSec=5
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+
+[Install]
+WantedBy=default.target
+EOF
+        echo "Created $SERVICE_FILE"
+        systemctl --user daemon-reload
+        systemctl --user enable --now "$SERVICE_NAME"
+        echo
+        echo "WhatsApp backend systemd service has been enabled and started!"
+        echo "To allow the backend to start at system boot even before desktop login, run:"
+        echo "  loginctl enable-linger \$USER"
+        ;;
+    disable-autostart)
+        echo "Disabling systemd autostart service..."
+        systemctl --user disable --now "$SERVICE_NAME" || true
+        rm -f "$SERVICE_FILE"
+        systemctl --user daemon-reload
+        echo "Autostart service removed."
+        ;;
+    status-autostart)
+        echo "Checking systemd autostart service status..."
+        systemctl --user status "$SERVICE_NAME" || true
         ;;
     *)
         usage

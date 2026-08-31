@@ -15,6 +15,11 @@
 'use strict';
 
 const puppeteer = require('./node_modules/puppeteer-core');
+const replyLib = require('./lib/reply');
+const avatarsLib = require('./lib/avatars');
+const messagesLib = require('./lib/messages');
+const pinsLib = require('./lib/pins');
+const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -35,6 +40,16 @@ let waPage = null;  // puppeteer Page
 let isReady = false; // WA app loaded & authenticated
 let browser = null;
 let currentOpenChatId = null;
+// Per-chat message cache: the widget polls getChatMessages every 5s and also
+// refetches after each send. Caching for a few seconds collapses those into
+// one real DOM/webpack scrape and lets the widget skip re-rendering when
+// nothing changed (via the returned `sig`).
+const MSG_CACHE_TTL_MS = 3000;
+const MSG_CACHE_MAX = 200; // only ever return the most recent N messages
+const msgCache = new Map(); // chatId -> { t, sig, messages }
+// Avatar bytes keyed by content hash; served via GET /api/avatar/<hash> so the
+// widget can use them as plain <img> sources (browser/QML caches the rest).
+const avatarStore = new Map();
 
 async function getValidPage() {
     if (!browser || typeof browser.isConnected !== 'function' || !browser.isConnected()) {
@@ -126,7 +141,7 @@ app.get('/api/status', (_req, res) => res.json({ ready: isReady }));
 
 // ── Auth middleware (applies to all routes below this line) ─────────────────
 app.use((req, res, next) => {
-    const key = req.headers['x-api-key'] || req.headers['api-key'];
+    const key = req.headers['x-api-key'] || req.headers['api-key'] || req.query.key;
     if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     next();
 });
@@ -149,6 +164,7 @@ app.post('/api/getAllChats', async (req, res) => {
                         name: c.formattedTitle || c.name || '',
                         formattedTitle: c.formattedTitle || '',
                         isGroup: !!c.isGroup,
+                        isPinned: !!(c.pin || c.isPinned),
                         unreadCount: c.unreadCount || 0,
                         t: c.t || 0,
                         lastMessage: c.lastMessage ? {
@@ -180,6 +196,7 @@ app.post('/api/getAllChats', async (req, res) => {
                                 name: c.formattedTitle || c.name || '',
                                 formattedTitle: c.formattedTitle || '',
                                 isGroup: !!c.isGroup,
+                                isPinned: !!(c.pin || c.isPinned),
                                 unreadCount: c.unreadCount || 0,
                                 t: c.t || 0,
                                 lastMessage: c.lastMessage ? {
@@ -223,6 +240,7 @@ app.post('/api/getAllChats', async (req, res) => {
                                         name: chat.formattedTitle || chat.name || '',
                                         formattedTitle: chat.formattedTitle || '',
                                         isGroup: !!chat.isGroup,
+                                        isPinned: !!(chat.pin || chat.isPinned),
                                         unreadCount: chat.unreadCount || 0,
                                         t: chat.t || 0,
                                         lastMessage: chat.lastMessage ? {
@@ -269,6 +287,30 @@ app.post('/api/getAllChats', async (req, res) => {
         res.json({ response: chats });
     } catch (e) {
         console.error('getAllChats error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── getPinnedChats ───────────────────────────────────────────────────────────
+app.all('/api/getPinnedChats', (_req, res) => {
+    try {
+        const pinned = pinsLib.getPinned();
+        res.json({ response: pinned });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── togglePinChat ───────────────────────────────────────────────────────────
+app.post('/api/togglePinChat', (req, res) => {
+    const body = req.body || {};
+    const args = body.args || body;
+    const chatId = args.chatId || args.id;
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+    try {
+        const updated = pinsLib.togglePin(chatId);
+        res.json({ response: updated });
+    } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
@@ -507,15 +549,42 @@ app.post('/api/getChatMessages', async (req, res) => {
                         if (m.sender) {
                             senderName = m.sender.formattedName || m.sender.name || m.sender.id.user || '';
                         }
-                        // Collect reactions if present
+                        // Collect reactions if present.
+                        // WA's reaction model exposes the emoji under `orphan`
+                        // (aggregation key) or `emoji`; `sent_by_me` and the
+                        // MaybeMeUser comparison give a reliable `fromMe`.
                         let reactions = [];
                         try {
                             if (m.reactions && m.reactions.length > 0) {
-                                reactions = m.reactions.map(r => ({
-                                    emoji: r.orphan || r.emoji || '',
-                                    sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
-                                    fromMe: !!(r.sender && r.sender.id && r.sender.id._serialized === window.Store && window.Store.MaybeMeUser),
-                                }));
+                                const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
+                                reactions = m.reactions.map(r => {
+                                    const emoji = r.orphan || r.emoji || r.reactionText || '';
+                                    let fromMe = !!r.sent_by_me;
+                                    try {
+                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                        if (me && sid) fromMe = fromMe || String(sid) === me;
+                                    } catch (_) { }
+                                    return {
+                                        emoji: emoji,
+                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
+                                        fromMe: fromMe,
+                                    };
+                                }).filter(r => r.emoji);
+                            }
+                        } catch (_) { }
+                        // Extract quoted (replied-to) message if present
+                        let quotedMsg = null;
+                        try {
+                            const qm = m.quotedMsg || (m.quotedStanzaInfo && m.quotedStanzaInfo.quotedMsg);
+                            if (qm) {
+                                let qSender = '';
+                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
+                                else if (m.quotedParticipant) qSender = m.quotedParticipant.user || String(m.quotedParticipant) || '';
+                                quotedMsg = {
+                                    body: qm.body || qm.content || qm.caption || '',
+                                    type: qm.type || 'chat',
+                                    senderName: qSender,
+                                };
                             }
                         } catch (_) { }
                         return {
@@ -526,6 +595,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                             fromMe: !!(m.id && m.id.fromMe),
                             senderName: senderName,
                             reactions: reactions,
+                            quotedMsg: quotedMsg,
                         };
                     });
                 } catch (e) {
@@ -557,15 +627,39 @@ app.post('/api/getChatMessages', async (req, res) => {
                                         if (msg.sender) {
                                             senderName = msg.sender.formattedName || msg.sender.name || msg.sender.id.user || '';
                                         }
-                                        // Collect reactions
+                                        // Collect reactions (same rules as Method A).
                                         let reactions = [];
                                         try {
                                             if (msg.reactions && msg.reactions.length > 0) {
-                                                reactions = msg.reactions.map(r => ({
-                                                    emoji: r.orphan || r.emoji || '',
-                                                    sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
-                                                    fromMe: !!(r.sender && r.sender.id && r.sender.id._serialized === window.Store && window.Store.MaybeMeUser),
-                                                }));
+                                                const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
+                                                reactions = msg.reactions.map(r => {
+                                                    const emoji = r.orphan || r.emoji || r.reactionText || '';
+                                                    let fromMe = !!r.sent_by_me;
+                                                    try {
+                                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                                        if (me && sid) fromMe = fromMe || String(sid) === me;
+                                                    } catch (_) { }
+                                                    return {
+                                                        emoji: emoji,
+                                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
+                                                        fromMe: fromMe,
+                                                    };
+                                                }).filter(r => r.emoji);
+                                            }
+                                        } catch (_) { }
+                                        // Extract quoted message if present
+                                        let quotedMsg = null;
+                                        try {
+                                            const qm = msg.quotedMsg || (msg.quotedStanzaInfo && msg.quotedStanzaInfo.quotedMsg);
+                                            if (qm) {
+                                                let qSender = '';
+                                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
+                                                else if (msg.quotedParticipant) qSender = msg.quotedParticipant.user || String(msg.quotedParticipant) || '';
+                                                quotedMsg = {
+                                                    body: qm.body || qm.content || qm.caption || '',
+                                                    type: qm.type || 'chat',
+                                                    senderName: qSender,
+                                                };
                                             }
                                         } catch (_) { }
                                         results.push({
@@ -576,6 +670,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                                             fromMe: !!(msg.id && msg.id.fromMe),
                                             senderName: senderName,
                                             reactions: reactions,
+                                            quotedMsg: quotedMsg,
                                         });
                                     }
                                 }
@@ -613,6 +708,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                                     fromMe: isOut,
                                     senderName: preText ? preText.split(']').pop().replace(':', '').trim() : (isOut ? 'Me' : ''),
                                     reactions: [],
+                                    quotedMsg: null,
                                 });
                             }
                         });
@@ -629,10 +725,186 @@ app.post('/api/getChatMessages', async (req, res) => {
             return msgs;
         }, chatId, isAlreadyOpen);
 
+        // Serve from cache when the previous scrape is younger than the TTL.
+        const since = messagesLib.parseSince(args.since);
+        const cached = msgCache.get(chatId);
+        if (cached && (Date.now() - cached.t) < MSG_CACHE_TTL_MS) {
+            const out = since ? messagesLib.filterMessagesSince(cached.messages, since) : cached.messages;
+            return res.json({ response: out, sig: cached.sig });
+        }
+
         console.log(`getChatMessages: returned ${messages.length} messages for chat ${chatId}`);
-        res.json({ response: messages });
+
+        // Cap payload size and compute a cheap change signature.
+        if (messages.length > MSG_CACHE_MAX) messages = messages.slice(-MSG_CACHE_MAX);
+        const lastMsg = messages.length ? messages[messages.length - 1] : {};
+        const sig = messages.length + ':' + (lastMsg.id || '') + ':' + (lastMsg.t || 0);
+        msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages });
+        const out = since ? messagesLib.filterMessagesSince(messages, since) : messages;
+        res.json({ response: out, sig: sig });
     } catch (e) {
         console.error('getChatMessages error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── waitMessages (long-poll) ────────────────────────────────────────────────
+// Resolves as soon as the chat's message signature changes (new message,
+// reaction, etc.) or after a timeout, so the widget gets near-instant
+// updates instead of blind 5s polling.
+app.post('/api/waitMessages', async (req, res) => {
+    const args = req.body.args || req.body;
+    const chatId = args.chatId || args.to;
+    const knownSig = args.sig == null ? '' : String(args.sig);
+
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+
+    try {
+        const waPage = await getValidPage();
+        if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
+
+        const out = await waitForSigChange({
+            getSig: async function () {
+                const cached = msgCache.get(chatId);
+                if (cached && (Date.now() - cached.t) < MSG_CACHE_TTL_MS) return cached.sig;
+                // Cheap probe: signature only, no full message extraction.
+                return await waPage.evaluate((cid) => {
+                    try {
+                        if (typeof window.require === 'undefined') return '';
+                        const names = ['WAWebChatCollection', 'WAWebStore', 'Store'];
+                        let coll = null;
+                        for (const n of names) {
+                            try {
+                                const m = window.require(n);
+                                const c = m.ChatCollection || m.ChatCollectionImpl || (m.default && m.default.Chat);
+                                if (c && typeof c.get === 'function') { coll = c; break; }
+                            } catch (e) { }
+                        }
+                        if (!coll) return '';
+                        const chat = coll.get(cid);
+                        if (!chat || !chat.msgs) return '';
+                        const arr = typeof chat.msgs.getModelsArray === 'function' ? chat.msgs.getModelsArray() : [];
+                        const last = arr.length ? arr[arr.length - 1] : {};
+                        const lid = last.id && last.id._serialized || last.id || '';
+                        return arr.length + ':' + lid + ':' + (last.t || 0);
+                    } catch (e) { return ''; }
+                }, chatId);
+            },
+            knownSig: knownSig,
+            intervalMs: 1000,
+            timeoutMs: 20000
+        });
+        res.json(out);
+    } catch (e) {
+        console.error('waitMessages error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── getAvatars (profile pictures) ───────────────────────────────────────────
+// Scrapes the small avatars WhatsApp already renders in the chat list, matches
+// them to chats by display name, and only ships bytes whose hash changed.
+app.post('/api/getAvatars', async (req, res) => {
+    const args = req.body.args || req.body;
+    const chats = Array.isArray(args.chats) ? args.chats : [];
+    const prevHashes = args.hashes || {};
+
+    try {
+        const waPage = await getValidPage();
+        if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
+
+        // extractAvatars(doc) is injectable for tests; run it against the
+        // live page's document here.
+        const extractSrc = avatarsLib.extractAvatars.toString();
+        const domEntries = await waPage.evaluate(new Function('return (' + extractSrc + ')(document);'));
+
+        // Resolve CDN/blob URLs to bytes inside the page (session cookies
+        // apply there). Bounded per call to keep latency acceptable; remaining
+        // entries are picked up on the next poll cycle.
+        const FETCH_LIMIT = 40;
+        let fetched = 0;
+        const domAvatars = [];
+        for (let i = 0; i < domEntries.length; i++) {
+            const e = domEntries[i];
+            if (e.kind === 'data') {
+                domAvatars.push({ name: e.name, base64: e.base64 });
+            } else if ((e.kind === 'https' || e.kind === 'blob') && fetched < FETCH_LIMIT) {
+                const fetchSrc = avatarsLib.fetchImageAsBase64.toString();
+                const b64 = await waPage.evaluate(new Function('return (' + fetchSrc + ')(' + JSON.stringify(e.src) + ');'));
+                if (b64) {
+                    domAvatars.push({ name: e.name, base64: b64 });
+                    fetched++;
+                }
+            }
+        }
+
+        const matched = avatarsLib.matchAvatarsToChats(chats, domAvatars);
+        const out = chats.map(function (c) {
+            const p = avatarsLib.avatarPayload(c.id, matched.get(c.id), prevHashes);
+            if (p.data) avatarStore.set(p.hash, p.data);
+            return { id: p.id, hash: p.hash, changed: p.changed, data: p.data };
+        });
+        console.log(`getAvatars: ${out.filter(a => a.changed).length} changed of ${out.length}`);
+        res.json({ response: out });
+    } catch (e) {
+        console.error('getAvatars error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── avatar bytes (GET, key via query so it works as an <img> source) ────────
+app.get('/api/avatar/:hash', (req, res) => {
+    const data = avatarStore.get(req.params.hash);
+    if (!data) return res.status(404).json({ error: 'Unknown avatar' });
+    const buf = Buffer.from(data, 'base64');
+    const isPng = data.slice(0, 8) === 'iVBORw0K';
+    res.set('Content-Type', isPng ? 'image/png' : 'image/jpeg');
+    res.set('Cache-Control', 'private, max-age=86400, immutable');
+    res.send(buf);
+});
+
+// ── debug: inspect chat-list DOM for avatar scraping ────────────────────────
+app.post('/api/debugChatListDom', async (_req, res) => {
+    try {
+        const waPage = await getValidPage();
+        if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
+        const info = await waPage.evaluate(() => {
+            const out = { rows: 0, imgs: 0, srcKinds: {}, titles: [], samples: [] };
+            const rows = document.querySelectorAll('[data-testid="cell-frame-container"]');
+            out.rows = rows.length;
+            const paneImgs = document.querySelectorAll('#pane-side img');
+            out.paneImgs = paneImgs.length;
+            const seen = {};
+            rows.forEach(function (row, i) {
+                const t = row.querySelector('[data-testid="cell-frame-title"] span') || row.querySelector('span[title]');
+                const title = t ? (t.title || t.textContent || '') : '';
+                const img = row.querySelector('img');
+                const src = img ? (img.getAttribute('src') || '') : null;
+                const kind = src == null ? 'none' : (src.indexOf('data:') === 0 ? 'data' : (src.indexOf('blob:') === 0 ? 'blob' : (src === '' ? 'empty' : 'other')));
+                seen[kind] = (seen[kind] || 0) + 1;
+                if (i < 5 && out.titles.length < 5) {
+                    out.titles.push(title);
+                    out.samples.push({ title: title, srcKind: kind, srcPrefix: src ? String(src).slice(0, 40) : src });
+                }
+            });
+            out.srcKinds = seen;
+            return out;
+        });
+        // Run the serialized extractor outside the closure above (Node side).
+        const extractSrc = avatarsLib.extractAvatars.toString();
+        let extracted = null;
+        try {
+            extracted = await waPage.evaluate(new Function('return (' + extractSrc + ')(document);'));
+        } catch (e) {
+            extracted = { error: e.message };
+        }
+        info.extractCount = Array.isArray(extracted) ? extracted.length : -3;
+        info.extractError = Array.isArray(extracted) ? null : (extracted && extracted.error || String(extracted));
+        info.extractSample = Array.isArray(extracted) ? extracted.slice(0, 3).map(function (e2) {
+            return { name: e2.name, kind: e2.kind, srcPrefix: e2.src ? String(e2.src).slice(0, 40) : undefined, b64Len: e2.base64 ? e2.base64.length : undefined };
+        }) : [];
+        res.json({ response: info });
+    } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
@@ -833,16 +1105,83 @@ app.post('/api/sendReaction', async (req, res) => {
 
 // ── sendText ─────────────────────────────────────────────────────────────────
 app.post('/api/sendText', async (req, res) => {
-    const body = req.body;
-    const args = body.args || body;
-    const chatId = args.to || args.chatId;
-    const text = args.content || args.text;
-
-    if (!chatId || !text) return res.status(400).json({ error: 'Missing to/content' });
+    const n = replyLib.normalizeSendMsgArgs(req.body);
+    const vErr = replyLib.validateSendArgs(n);
+    if (vErr) return res.status(400).json({ error: vErr });
+    const { chatId, text, replyToId } = n;
 
     try {
         const waPage = await getValidPage();
         if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
+
+        // ── Reply (quoted message) branch ──────────────────────────────────────
+        if (replyLib.isReply(n)) {
+            let replyDone = false;
+
+            // 0. Preferred: send the quoted reply through WhatsApp's own
+            //    webpack modules (no GUI context-menu simulation needed).
+            try {
+                const nat = await waPage.evaluate(replyLib.sendNativeReply,
+                    { chatId: chatId, text: text, msgId: replyToId });
+                if (nat && nat.sent) {
+                    if (nat.quoted === false) {
+                        console.warn('sendText: native reply sent but quote could not be verified');
+                    }
+                    console.log(`sendText: replied to ${replyToId} via webpack (${text.length} chars)`);
+                    msgCache.delete(chatId);
+                    return res.json({ response: 'sent_reply' });
+                }
+                console.log(`sendText: native reply unavailable (${nat && nat.reason}), trying GUI path`);
+            } catch (e) {
+                console.error('sendText: native reply attempt failed:', e.message);
+            }
+
+            try {
+                await forceOpenChat(waPage, chatId);
+                console.log(`sendText: sending REPLY to ${chatId} quoting ${replyToId}`);
+
+                // 1. Locate the message and open WhatsApp's context menu on it.
+                const probe = await waPage.evaluate(replyLib.probeReplyMessage, { msgId: replyToId });
+                if (probe && probe.found) {
+                    await new Promise(r => setTimeout(r, 400));
+
+                    // 2. Click the native "Reply" menu item.
+                    const clicked = await waPage.evaluate(replyLib.clickReplyMenuItem, {});
+                    if (clicked && clicked.clicked) {
+                        await new Promise(r => setTimeout(r, 450));
+
+                        // 3. Type the reply text and send (same input path as DOM send).
+                        const inputSel = '#main div[contenteditable="true"][data-tab="10"], #main div[contenteditable="true"]';
+                        await waPage.waitForSelector(inputSel, { visible: true, timeout: 5000 });
+                        await waPage.focus(inputSel);
+                        await waPage.type(inputSel, text, { delay: 5 });
+                        await new Promise(r => setTimeout(r, 200));
+                        const sendSel = '#main span[data-icon="send"], #main [data-testid="send"]';
+                        const sendBtn = await waPage.$(sendSel);
+                        if (sendBtn) await waPage.click(sendSel);
+                        else await waPage.keyboard.press('Enter');
+                        await new Promise(r => setTimeout(r, 500));
+                        console.log(`sendText: replied to ${replyToId} with ${text.length} chars`);
+                        replyDone = true;
+                    }
+                }
+            } catch (e) {
+                console.error('sendText: reply attempt failed:', e.message);
+            }
+
+            // Never silently downgrade a requested reply to a plain (unquoted)
+            // message — that is exactly what made "reply" behave wrongly. If the
+            // target message or the context menu cannot be resolved, fail loudly
+            // (HTTP 422) and leave the pending reply intact for the caller.
+            if (!replyDone) {
+                console.error(`sendText: could not perform reply for ${replyToId}; NOT sending plain text.`);
+                return res.status(422).json({
+                    error: 'Reply target message was not found or the reply UI could not be opened (the quoted message may be scrolled out of the DOM). No message was sent; retry.'
+                });
+            }
+            msgCache.delete(chatId);
+            return res.json({ response: 'sent_reply' });
+        }
 
         // ── Method 1: Webpack internal send module (Try first without GUI open for instant delivery) ──
         let sent = false;
@@ -900,6 +1239,7 @@ app.post('/api/sendText', async (req, res) => {
 
         if (sent) {
             console.log(`sendText: sent ${text.length} chars to ${chatId} via webpack`);
+            msgCache.delete(chatId);
             return res.json({ response: 'sent' });
         }
 
@@ -930,6 +1270,7 @@ app.post('/api/sendText', async (req, res) => {
         
         await new Promise(r => setTimeout(r, 500));
         console.log(`sendText: sent ${text.length} chars to ${chatId} via Puppeteer DOM`);
+        msgCache.delete(chatId);
         res.json({ response: 'sent_via_dom' });
 
     } catch (e) {
@@ -937,6 +1278,282 @@ app.post('/api/sendText', async (req, res) => {
         res.status(500).json({ error: e.message });
     }
 });
+
+// ── Helper to normalize local file paths (handles file://, URI encoding, spaces) ─
+function normalizeLocalPath(rawPath) {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    let p = rawPath.trim();
+    if (p.startsWith('file://')) {
+        try {
+            const parsed = new URL(p);
+            p = decodeURIComponent(parsed.pathname);
+        } catch (_) {
+            p = decodeURIComponent(p.replace(/^file:\/\//, ''));
+        }
+    } else {
+        try {
+            p = decodeURIComponent(p);
+        } catch (_) { }
+    }
+    return p;
+}
+
+// ── Environment helper for clipboard tools ──────────────────────────────────
+function getEnvForClipboard() {
+    const env = { ...process.env };
+    if (!env.WAYLAND_DISPLAY && fs.existsSync('/run/user/' + process.getuid() + '/wayland-0')) {
+        env.WAYLAND_DISPLAY = 'wayland-0';
+    }
+    if (!env.XDG_RUNTIME_DIR) {
+        env.XDG_RUNTIME_DIR = '/run/user/' + process.getuid();
+    }
+    if (!env.DISPLAY) {
+        env.DISPLAY = ':0';
+    }
+    return env;
+}
+
+// ── Helper to extract image/media from clipboard ─────────────────────────────
+async function extractClipboardMedia(outputPath) {
+    const env = getEnvForClipboard();
+
+    // 1. Try Wayland (wl-paste)
+    const wlResult = await new Promise((resolve) => {
+        exec('wl-paste --list-types', { env }, (err, stdout) => {
+            if (err || !stdout) return resolve(null);
+            const types = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+
+            // Check for raw image mime
+            const imgType = types.find(t => t.startsWith('image/'));
+            if (imgType) {
+                exec(`wl-paste -t "${imgType}" > "${outputPath}"`, { env }, (err2) => {
+                    if (!err2 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+                        return resolve({ type: 'image_file', path: outputPath });
+                    }
+                    resolve(null);
+                });
+                return;
+            }
+
+            // Check for text/uri-list (e.g. copied file in Dolphin / file manager)
+            if (types.includes('text/uri-list')) {
+                exec('wl-paste -t text/uri-list', { env }, (err2, uriOut) => {
+                    if (!err2 && uriOut) {
+                        const lines = uriOut.split('\n').map(s => s.trim()).filter(Boolean);
+                        for (const line of lines) {
+                            const p = normalizeLocalPath(line);
+                            if (p && fs.existsSync(p) && /\.(jpe?g|png|gif|mp4|mov|avi|webp|bmp)$/i.test(p)) {
+                                return resolve({ type: 'image_file', path: p });
+                            }
+                        }
+                    }
+                    resolve(null);
+                });
+                return;
+            }
+
+            resolve(null);
+        });
+    });
+
+    if (wlResult) return wlResult;
+
+    // 2. Try X11 (xclip)
+    const xclipResult = await new Promise((resolve) => {
+        exec('xclip -selection clipboard -t TARGETS -o', { env }, (err, stdout) => {
+            if (err || !stdout) {
+                exec(`xclip -selection clipboard -t image/png -o > "${outputPath}"`, { env }, (err2) => {
+                    if (!err2 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+                        return resolve({ type: 'image_file', path: outputPath });
+                    }
+                    resolve(null);
+                });
+                return;
+            }
+
+            const targets = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+            const imgTarget = targets.find(t => t.startsWith('image/') || t === 'image/png' || t === 'image/jpeg');
+            if (imgTarget) {
+                exec(`xclip -selection clipboard -t "${imgTarget}" -o > "${outputPath}"`, { env }, (err2) => {
+                    if (!err2 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+                        return resolve({ type: 'image_file', path: outputPath });
+                    }
+                    resolve(null);
+                });
+                return;
+            }
+
+            if (targets.includes('text/uri-list')) {
+                exec('xclip -selection clipboard -t text/uri-list -o', { env }, (err2, uriOut) => {
+                    if (!err2 && uriOut) {
+                        const lines = uriOut.split('\n').map(s => s.trim()).filter(Boolean);
+                        for (const line of lines) {
+                            const p = normalizeLocalPath(line);
+                            if (p && fs.existsSync(p) && /\.(jpe?g|png|gif|mp4|mov|avi|webp|bmp)$/i.test(p)) {
+                                return resolve({ type: 'image_file', path: p });
+                            }
+                        }
+                    }
+                    resolve(null);
+                });
+                return;
+            }
+
+            resolve(null);
+        });
+    });
+
+    return xclipResult;
+}
+
+// ── Shared Media / File Sender ───────────────────────────────────────────────
+async function sendMediaFile(waPage, chatId, filePath, caption = '') {
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${filePath}`);
+    }
+
+    console.log(`sendMediaFile: preparing to send ${filePath} to ${chatId}`);
+
+    // Ensure chat is open
+    await forceOpenChat(waPage, chatId);
+    await new Promise(r => setTimeout(r, 400));
+
+    // Find any existing file input or click attach button to mount
+    let fileInputs = await waPage.$$('input[type="file"]');
+    if (fileInputs.length === 0) {
+        await waPage.evaluate(() => {
+            const attachBtn = document.querySelector('[aria-label="Attach"]') ||
+                document.querySelector('[data-icon="plus-rounded"]') ||
+                document.querySelector('[data-icon="plus"]')?.closest('button') ||
+                document.querySelector('[data-testid="plus"]') ||
+                document.querySelector('[data-testid="attach-menu-plus"]');
+            if (attachBtn) attachBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 600));
+        fileInputs = await waPage.$$('input[type="file"]');
+    }
+
+    if (fileInputs.length === 0) {
+        await waPage.evaluate(() => {
+            const attachBtn = document.querySelector('[aria-label="Attach"]') ||
+                document.querySelector('[data-icon="plus-rounded"]') ||
+                document.querySelector('[data-icon="plus"]')?.closest('button') ||
+                document.querySelector('[data-testid="plus"]');
+            if (attachBtn) attachBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 800));
+        fileInputs = await waPage.$$('input[type="file"]');
+    }
+
+    if (fileInputs.length === 0) {
+        throw new Error('Could not find file input in attach menu');
+    }
+
+    // Determine appropriate input. WhatsApp mounts several hidden inputs:
+    // photos/videos (accept includes video) and stickers (image/webp only).
+    // Pasting an image must go out as a PHOTO, never as a sticker, so we
+    // prefer the photo/video input and explicitly avoid webp-only inputs.
+    const isMedia = /\.(jpe?g|png|gif|mp4|mov|avi|webp|bmp)$/i.test(filePath);
+    const isImage = /\.(jpe?g|png|gif|bmp)$/i.test(filePath);
+    const inputAccepts = [];
+    for (const input of fileInputs) {
+        const accept = await waPage.evaluate(el => el.accept || '', input);
+        inputAccepts.push({ input: input, accept: accept });
+    }
+
+    let selectedInput = null;
+    if (isImage || isMedia) {
+        // 1) Photo/video input: its accept string is the only one listing video.
+        for (const it of inputAccepts) {
+            if (it.accept.includes('video')) { selectedInput = it.input; break; }
+        }
+        // 2) A generic image input that is NOT the sticker picker.
+        if (!selectedInput) {
+            for (const it of inputAccepts) {
+                if (it.accept.includes('image') && !it.accept.includes('webp')) { selectedInput = it.input; break; }
+            }
+        }
+    }
+    if (!selectedInput) {
+        for (const it of inputAccepts) {
+            if (isMedia && (it.accept.includes('image') || it.accept.includes('video'))) { selectedInput = it.input; break; }
+        }
+    }
+    if (!selectedInput) {
+        for (const it of inputAccepts) {
+            if (!isMedia && (it.accept.includes('*') || it.accept === '')) { selectedInput = it.input; break; }
+        }
+    }
+    if (!selectedInput) {
+        selectedInput = inputAccepts.length > 0 ? inputAccepts[0].input : fileInputs[0];
+    }
+
+    // Upload the file
+    await selectedInput.uploadFile(filePath);
+
+    // Wait for the preview stage / send button
+    const previewSendSelectors = [
+        '[data-testid="send"]',
+        'div[role="button"][aria-label="Send"]',
+        'span[data-icon="send"]',
+        'span[data-icon="send-light"]',
+        'span[data-icon="send-inverted"]',
+        '[data-testid="media-send-button"]',
+        'button[aria-label="Send"]',
+        'button[type="submit"]'
+    ];
+    const previewSelectorCombined = previewSendSelectors.join(', ');
+
+    let sendBtnFound = false;
+    for (let i = 0; i < 30; i++) {
+        const hasBtn = await waPage.evaluate((sel) => {
+            return !!document.querySelector(sel);
+        }, previewSelectorCombined);
+        if (hasBtn) {
+            sendBtnFound = true;
+            break;
+        }
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (!sendBtnFound) {
+        console.warn('sendMediaFile: Send button selector not detected within 9s, attempting fallback send...');
+    }
+
+    // Add caption if provided
+    if (caption) {
+        await waPage.evaluate((text) => {
+            const captionInput = document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
+                document.querySelector('div[contenteditable="true"][data-testid="media-caption-input"]') ||
+                document.querySelector('div[contenteditable="true"]');
+            if (captionInput) {
+                captionInput.focus();
+                document.execCommand('insertText', false, text);
+                captionInput.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }, caption);
+        await new Promise(r => setTimeout(r, 200));
+    }
+
+    // Click send or press Enter
+    const clicked = await waPage.evaluate((sel) => {
+        const btn = document.querySelector(sel);
+        if (btn) {
+            btn.click();
+            return true;
+        }
+        return false;
+    }, previewSelectorCombined);
+
+    if (!clicked) {
+        await waPage.keyboard.press('Enter');
+    }
+
+    // Wait for send to complete
+    await new Promise(r => setTimeout(r, 2500));
+    console.log(`sendMediaFile: successfully processed ${filePath}`);
+    return true;
+}
 
 // ── sendFile ─────────────────────────────────────────────────────────────────
 app.post('/api/sendFile', async (req, res) => {
@@ -948,13 +1565,9 @@ app.post('/api/sendFile', async (req, res) => {
 
     if (!chatId || !rawPath) return res.status(400).json({ error: 'Missing chatId or filePath' });
 
-    let filePath = rawPath;
-    if (filePath.startsWith('file://')) {
-        filePath = filePath.substring(7); // strip file://
-    }
-
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: `File not found: ${filePath}` });
+    const filePath = normalizeLocalPath(rawPath);
+    if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: `File not found: ${filePath || rawPath}` });
     }
 
     console.log(`sendFile: sending ${filePath} to ${chatId}`);
@@ -963,82 +1576,8 @@ app.post('/api/sendFile', async (req, res) => {
         const waPage = await getValidPage();
         if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
 
-        // First select the chat in the UI to make sure it's open
-        await forceOpenChat(waPage, chatId);
-
-        // Click the attach menu button to mount file inputs
-        await waPage.evaluate(() => {
-            const attachBtn = document.querySelector('[data-testid="plus"]') ||
-                document.querySelector('[data-icon="plus"]')?.closest('button') ||
-                document.querySelector('[aria-label="Attach"]') ||
-                document.querySelector('[data-testid="attach-menu-plus"]');
-            if (attachBtn) attachBtn.click();
-        });
-
-        await new Promise(r => setTimeout(r, 600)); // wait for inputs to mount
-
-        // Find file inputs
-        const fileInputs = await waPage.$$('input[type="file"]');
-        if (fileInputs.length === 0) {
-            throw new Error('No file inputs found in attach menu');
-        }
-
-        // Choose which input to use based on file type
-        let selectedInput = fileInputs[0];
-        const isMedia = /\.(jpe?g|png|gif|mp4|mov|avi|webp)$/i.test(filePath);
-        if (fileInputs.length > 1) {
-            if (isMedia) {
-                for (const input of fileInputs) {
-                    const accept = await waPage.evaluate(el => el.accept || '', input);
-                    if (accept.includes('image') || accept.includes('video')) {
-                        selectedInput = input;
-                        break;
-                    }
-                }
-            } else {
-                for (const input of fileInputs) {
-                    const accept = await waPage.evaluate(el => el.accept || '', input);
-                    if (accept.includes('*') || accept === '') {
-                        selectedInput = input;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Upload the file
-        await selectedInput.uploadFile(filePath);
-
-        // Wait for preview screen
-        const sendBtnSelector = 'span[data-icon="send"], [data-testid="send"]';
-        await waPage.waitForSelector(sendBtnSelector, { timeout: 15000 });
-
-        // Add caption if provided
-        if (caption) {
-            await waPage.evaluate((text) => {
-                const captionInput = document.querySelector('div[contenteditable="true"][data-tab="10"]') ||
-                    document.querySelector('div[contenteditable="true"]');
-                if (captionInput) {
-                    captionInput.focus();
-                    document.execCommand('insertText', false, text);
-                    captionInput.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }, caption);
-            await new Promise(r => setTimeout(r, 200));
-        }
-
-        // Click send button
-        await waPage.evaluate(() => {
-            const sendBtn = document.querySelector('[data-testid="send"]') ||
-                document.querySelector('span[data-icon="send"]')?.closest('button') ||
-                document.querySelector('button[type="submit"]');
-            if (sendBtn) sendBtn.click();
-        });
-
-        // Wait for send to complete
-        await new Promise(r => setTimeout(r, 2500));
-
-        console.log(`sendFile: successfully sent ${filePath}`);
+        await sendMediaFile(waPage, chatId, filePath, caption);
+        msgCache.delete(chatId);
         res.json({ response: 'sent' });
     } catch (e) {
         console.error('sendFile error:', e.message);
@@ -1047,151 +1586,40 @@ app.post('/api/sendFile', async (req, res) => {
 });
 
 // ── pasteImage ───────────────────────────────────────────────────────────────
+// Default behaviour: SAVE the clipboard image and return its path so the
+// widget can attach it as a draft (the user sends it explicitly with the
+// send button). Passing args.send = true restores the legacy "send at once".
 app.post('/api/pasteImage', async (req, res) => {
     const body = req.body;
     const args = body.args || body;
     const chatId = args.to || args.chatId;
-
-    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+    const autoSend = args.send === true;
 
     const outputPath = path.join(__dirname, '..', 'clipboard_pasted.png');
 
     try {
         const waPage = await getValidPage();
         if (!isReady || !waPage) return res.status(503).json({ error: 'Not ready' });
-        // Retrieve clipboard image
-        await new Promise((resolve, reject) => {
-            // Check Wayland (wl-paste)
-            exec('wl-paste --list-types', (err, stdout) => {
-                if (!err && (stdout.includes('image/png') || stdout.includes('image/jpeg'))) {
-                    const mime = stdout.includes('image/png') ? 'image/png' : 'image/jpeg';
-                    exec(`wl-paste -t ${mime} > "${outputPath}"`, (err2) => {
-                        if (!err2) return resolve();
-                        reject(err2);
-                    });
-                } else {
-                    // Check X11 (xclip)
-                    exec('xclip -selection clipboard -t image/png -o > /dev/null', (err3) => {
-                        if (!err3) {
-                            exec(`xclip -selection clipboard -t image/png -o > "${outputPath}"`, (err4) => {
-                                if (!err4) return resolve();
-                                reject(err4);
-                            });
-                        } else {
-                            reject(new Error('No image in clipboard'));
-                        }
-                    });
-                }
-            });
-        });
 
-        // Now call the file upload logic using outputPath
-        console.log(`pasteImage: sending clipboard image ${outputPath} to ${chatId}`);
-
-        // First select the chat in the UI to make sure it's open
-        await waPage.evaluate(async (cid) => {
-            let chatMod = null;
-            try {
-                if (typeof window.require !== 'undefined') {
-                    const chatNames = ['WAWebChatCollection', 'WAWebStore', 'Store'];
-                    for (const name of chatNames) {
-                        try {
-                            const m = window.require(name);
-                            const coll = m.ChatCollection || m.ChatCollectionImpl || (m.default && m.default.Chat);
-                            if (coll && typeof coll.get === 'function') {
-                                chatMod = coll;
-                                break;
-                            }
-                        } catch (e) { }
-                    }
-                }
-            } catch (e) { }
-
-            let chat = null;
-            if (chatMod) chat = chatMod.get(cid);
-            if (chat) {
-                if (typeof chat.onSelected === 'function') await chat.onSelected();
-                else if (typeof chat.select === 'function') await chat.select();
-            } else {
-                const chatList = document.querySelector('#pane-side') || document.querySelector('[data-testid="chat-list"]');
-                if (chatList) {
-                    let chatRow = null;
-                    const fiberKey = Object.keys(chatList).find(k => k.startsWith('__reactFiber'));
-                    if (fiberKey) {
-                        let fiber = chatList[fiberKey];
-                        const seen = new Set();
-                        let depth = 0;
-                        function walk(f) {
-                            if (!f || chatRow || depth > 200 || seen.has(f)) return;
-                            seen.add(f); depth++;
-                            if (f.memoizedProps && (f.memoizedProps.chat || f.memoizedProps.model)) {
-                                const c = f.memoizedProps.chat || f.memoizedProps.model;
-                                if (c.id && c.id._serialized === cid) {
-                                    chatRow = f.stateNode;
-                                }
-                            }
-                            walk(f.child); walk(f.sibling);
-                        }
-                        walk(fiber);
-                    }
-                    if (chatRow) chatRow.click();
-                }
-            }
-        }, chatId);
-
-        await new Promise(r => setTimeout(r, 800)); // wait for chat to load
-
-        // Click attach menu
-        await waPage.evaluate(() => {
-            const attachBtn = document.querySelector('[data-testid="plus"]') ||
-                document.querySelector('[data-icon="plus"]')?.closest('button') ||
-                document.querySelector('[aria-label="Attach"]') ||
-                document.querySelector('[data-testid="attach-menu-plus"]');
-            if (attachBtn) attachBtn.click();
-        });
-
-        await new Promise(r => setTimeout(r, 600)); // wait for inputs to mount
-
-        // Find file inputs
-        const fileInputs = await waPage.$$('input[type="file"]');
-        if (fileInputs.length === 0) {
-            throw new Error('No file inputs found in attach menu');
+        const media = await extractClipboardMedia(outputPath);
+        if (!media || !media.path) {
+            console.log('pasteImage: no image or media found in clipboard');
+            return res.json({ response: 'no_image' });
         }
 
-        // Choose the media input
-        let selectedInput = fileInputs[0];
-        if (fileInputs.length > 1) {
-            for (const input of fileInputs) {
-                const accept = await waPage.evaluate(el => el.accept || '', input);
-                if (accept.includes('image') || accept.includes('video')) {
-                    selectedInput = input;
-                    break;
-                }
-            }
+        if (!autoSend) {
+            console.log(`pasteImage: clipboard media saved as draft: ${media.path}`);
+            return res.json({ response: 'saved', path: media.path });
         }
 
-        // Upload the file
-        await selectedInput.uploadFile(outputPath);
+        if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
 
-        // Wait for preview screen
-        const sendBtnSelector = 'span[data-icon="send"], [data-testid="send"]';
-        await waPage.waitForSelector(sendBtnSelector, { timeout: 15000 });
-
-        // Click send button
-        await waPage.evaluate(() => {
-            const sendBtn = document.querySelector('[data-testid="send"]') ||
-                document.querySelector('span[data-icon="send"]')?.closest('button') ||
-                document.querySelector('button[type="submit"]');
-            if (sendBtn) sendBtn.click();
-        });
-
-        // Wait for send to complete
-        await new Promise(r => setTimeout(r, 2500));
-
+        console.log(`pasteImage: sending clipboard media ${media.path} to ${chatId}`);
+        await sendMediaFile(waPage, chatId, media.path);
         console.log(`pasteImage: successfully sent pasted image`);
         res.json({ response: 'sent' });
     } catch (e) {
-        if (e.message.includes('No image in clipboard')) {
+        if (e.message.includes('No image in clipboard') || e.message.includes('no_image')) {
             console.log('pasteImage: no image in clipboard');
             res.json({ response: 'no_image' });
         } else {

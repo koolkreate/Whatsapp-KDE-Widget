@@ -1,0 +1,16 @@
+[Unit]
+Description=WhatsApp KDE Widget Backend Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/whatsapp-kde-widget/backend
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/projects/whatsapp-kde-widget/backend.log
+StandardError=append:%h/projects/whatsapp-kde-widget/backend.log
+
+[Install]
+WantedBy=default.target

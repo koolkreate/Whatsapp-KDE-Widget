@@ -4,7 +4,8 @@
   "description": "Headless backend for WhatsApp KDE Widget",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@open-wa/wa-automate": "latest",

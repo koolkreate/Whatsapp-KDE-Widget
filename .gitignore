@@ -5,6 +5,7 @@ backend/node_modules/
 # Local session files & credentials (CRITICAL)
 backend/_IGNORE_whatsapp-kde-session/
 backend/whatsapp-kde-session.data.json
+backend/data/*.json
 qr.png
 
 # Custom Chrome binary folder

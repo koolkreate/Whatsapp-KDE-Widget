@@ -5,6 +5,8 @@ import QtQuick.Controls
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components 3.0 as PlasmaComponents
 import QtQuick.Dialogs
+import "messageUtils.js" as MsgUtils
+import "pollingUtils.js" as PollUtils
 
 PlasmoidItem {
     id: root
@@ -31,17 +33,103 @@ PlasmoidItem {
     property string statusMessage: "Connecting to backend…"
     property int    totalUnread:  0
     property bool   sendInFlight: false
+    property bool   chatsInFlight: false
+    property bool   messagesInFlight: false
+    property string lastMsgSig: ""   // change signature of the open chat
+    property int    pollStreak: 0          // consecutive unchanged polls (backoff)
+    property int    pollsSinceFull: 0      // incremental fetches since last full refresh
+    property bool   waitLoopRunning: false // long-poll chain guard
+    property var    chatAvatarHashes: ({}) // chatId -> avatar hash
     signal messageSent(bool success)
     property bool   emojiPickerVisible: false
     property string activeReactionMsgId: ""  // msg id for reaction popup
+    property string pendingReplyId: ""     // msg id being replied to (quoted send)
+    property string replyPreviewLabel: ""  // short preview shown in the quote bar
+    property var    contextReplyMsg: null  // message that was right-clicked
+    property var    contextChat: null      // chat that was right-clicked
+    property var    pinnedChats: []        // list of pinned chat IDs
+    property string pendingAttachmentPath: "" // pasted image waiting to be sent
+    property bool   copyToastVisible: false
+
+    function isChatPinned(chat) {
+        if (!chat) return false;
+        if (typeof chat === "object" && chat.isPinned) return true;
+        var cid = (typeof chat === "string") ? chat : (chat.id || "");
+        if (!cid || !root.pinnedChats) return false;
+        for (var i = 0; i < root.pinnedChats.length; i++) {
+            if (root.pinnedChats[i] === cid) return true;
+        }
+        return false;
+    }
+
+    function sortAndFilterChats() {
+        if (!root.allChats || root.allChats.length === 0) {
+            root.filteredChats = [];
+            return;
+        }
+        root.allChats.sort(function(a, b) {
+            var pa = root.isChatPinned(a) ? 1 : 0, pb = root.isChatPinned(b) ? 1 : 0;
+            if (pa !== pb) return pb - pa;
+            var ua = a.unreadCount || 0, ub = b.unreadCount || 0;
+            if (ua !== ub) return ub - ua;
+            var ta = (a.t || a.lastMessage && a.lastMessage.t) || 0;
+            var tb = (b.t || b.lastMessage && b.lastMessage.t) || 0;
+            return tb - ta;
+        });
+        filterChats();
+    }
+
+    function fetchPinnedChats() {
+        if (!root.isConnected) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getPinnedChats");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.pinnedChats = r.response || [];
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: {} }));
+    }
+
+    function togglePinChat(chatId) {
+        if (!root.isConnected || !chatId) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/togglePinChat");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.pinnedChats = r.response || [];
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId } }));
+    }
 
     // Emoji-supporting font - use Noto Color Emoji if available, fallback to default
     readonly property string emojiFont: "Noto Color Emoji, emoji, monospace"
 
     onActiveChatChanged: {
+        root.clearPendingReply();
+        root.clearPendingAttachment();
+        root.lastMsgSig = "";
+        root.pollStreak = 0;
+        root.pollsSinceFull = 0;
         if (activeChat !== null) {
             root.activeChatMessages = [];
             fetchMessages(activeChat.id);
+            messageWaitLoop();
         }
     }
 
@@ -102,6 +190,35 @@ PlasmoidItem {
         return body.length > 48 ? body.substring(0, 48) + "…" : body;
     }
 
+    // ── Reply & copy helpers ──────────────────────────────────────────────────
+    function clearPendingReply() {
+        root.pendingReplyId = "";
+        root.replyPreviewLabel = "";
+    }
+
+    function startReplyFromContext() {
+        if (!root.contextReplyMsg) return;
+        var m = root.contextReplyMsg;
+        root.pendingReplyId = m.id || "";
+        root.replyPreviewLabel = MsgUtils.replyPreviewText(m);
+        if (root.messageInputRef) root.messageInputRef.forceActiveFocus();
+    }
+
+    function copyToClipboard(text) {
+        if (!text) return;
+        clipTextEdit.text = text;
+        clipTextEdit.selectAll();
+        clipTextEdit.copy();
+        clipTextEdit.deselect();
+        root.copyToastVisible = true;
+        copyToastTimer.restart();
+    }
+
+    function copyContextMessage() {
+        if (!root.contextReplyMsg) return;
+        root.copyToClipboard(MsgUtils.copyTextForMessage(root.contextReplyMsg));
+    }
+
     // ── API ──────────────────────────────────────────────────────────────────
     function checkStatus() {
         var xhr = new XMLHttpRequest();
@@ -114,6 +231,7 @@ PlasmoidItem {
                     if (res.ready) {
                         root.isConnected = true;
                         root.statusMessage = "";
+                        fetchPinnedChats();
                         fetchChats();
                     } else {
                         root.isConnected = false;
@@ -132,7 +250,8 @@ PlasmoidItem {
     }
 
     function fetchChats() {
-        if (!root.isConnected) return;
+        if (!root.isConnected || root.chatsInFlight) return;
+        root.chatsInFlight = true;
         root.isLoading = true;
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/getAllChats");
@@ -140,24 +259,17 @@ PlasmoidItem {
         xhr.setRequestHeader("X-API-Key",     apiKey);
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.chatsInFlight = false;
             root.isLoading = false;
             if (xhr.status === 200) {
                 try {
                     var r = JSON.parse(xhr.responseText);
-                    var chats = r.response || r;
-                    // Sort: unread first, then by timestamp desc
-                    chats.sort(function(a, b) {
-                        var ua = a.unreadCount || 0, ub = b.unreadCount || 0;
-                        if (ua !== ub) return ub - ua;
-                        var ta = (a.t || a.lastMessage && a.lastMessage.t) || 0;
-                        var tb = (b.t || b.lastMessage && b.lastMessage.t) || 0;
-                        return tb - ta;
-                    });
                     root.allChats = chats;
                     var u = 0;
                     for (var i = 0; i < chats.length; i++) u += chats[i].unreadCount || 0;
                     root.totalUnread = u;
-                    filterChats();
+                    sortAndFilterChats();
+                    fetchAvatars();
                 } catch(e) {
                     console.log("Parse error:", e);
                 }
@@ -169,33 +281,145 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: {} }));
     }
 
-    function fetchMessages(chatId) {
-        if (!root.isConnected || !chatId) return;
-        root.isLoadingMessages = true;
+    // ── Avatars ──────────────────────────────────────────────────────────────
+    // Asks the backend for avatar hashes; only changed images ship bytes and
+    // are then served by GET /api/avatar/<hash> (cached by the image loader).
+    function fetchAvatars() {
+        if (!root.isConnected || root.allChats.length === 0) return;
+        var req = [];
+        var hashes = {};
+        for (var i = 0; i < root.allChats.length; i++) {
+            var c = root.allChats[i];
+            req.push({ id: c.id, name: c.name });
+            if (root.chatAvatarHashes[c.id]) hashes[c.id] = root.chatAvatarHashes[c.id];
+        }
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getAvatars");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status !== 200) return;
+            try {
+                var r = JSON.parse(xhr.responseText);
+                var items = r.response || [];
+                var updated = {};
+                for (var k in root.chatAvatarHashes) updated[k] = root.chatAvatarHashes[k];
+                for (var j = 0; j < items.length; j++) {
+                    if (items[j].changed && items[j].hash) updated[items[j].id] = items[j].hash;
+                }
+                root.chatAvatarHashes = updated;
+            } catch (e) {
+                console.log("Avatars parse error:", e);
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chats: req, hashes: hashes } }));
+    }
+
+    function avatarSource(chatId) {
+        var h = root.chatAvatarHashes[chatId];
+        return h ? apiHost + "/api/avatar/" + h + "?key=" + apiKey : "";
+    }
+
+    // ── Long-poll message loop ───────────────────────────────────────────────
+    // Replaces blind 5s polling: the backend resolves as soon as the open
+    // chat changes (or after ~20s), then we do an incremental fetch. On
+    // errors we fall back to an adaptive poll interval.
+    function messageWaitLoop() {
+        if (!root.isConnected || root.activeChat === null || root.waitLoopRunning) return;
+        root.waitLoopRunning = true;
+        var chatId = root.activeChat.id;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/waitMessages");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.timeout = 25000;
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.waitLoopRunning = false;
+            var changed = false;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    changed = !!r.changed;
+                    if (r.sig && r.sig !== root.lastMsgSig) root.lastMsgSig = r.sig;
+                } catch (e) { }
+            }
+            if (xhr.status === 200 && changed && root.activeChat && root.activeChat.id === chatId) {
+                fetchMessages(chatId, true);
+                messageWaitLoop(); // keep the chain going
+            } else if (xhr.status !== 200) {
+                // Error path: exponential backoff via messageWaitBackoff timer.
+                root.pollStreak++;
+                messageWaitBackoff.restart();
+            } else {
+                // Timeout with no change — immediately re-attach.
+                messageWaitLoop();
+            }
+        };
+        try {
+            xhr.send(JSON.stringify({ args: { chatId: chatId, sig: root.lastMsgSig } }));
+        } catch (e) {
+            root.waitLoopRunning = false;
+            messageWaitBackoff.restart();
+        }
+    }
+
+    function fetchMessages(chatId, background) {
+        if (!root.isConnected || !chatId || root.messagesInFlight) return;
+        root.messagesInFlight = true;
+        if (!background) root.isLoadingMessages = true;
+
+        // Background polls ask the backend only for messages newer than what
+        // we already hold (with a periodic full refresh as a safety net).
+        var existing = root.activeChatMessages;
+        var useSince = background && existing.length > 0 && root.pollsSinceFull < 12;
+        var args = { chatId: chatId };
+        if (useSince) {
+            var lastKnown = existing[existing.length - 1];
+            args.since = { id: lastKnown.id, t: lastKnown.t || 0 };
+        }
+
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/getChatMessages");
         xhr.setRequestHeader("Content-Type",  "application/json");
         xhr.setRequestHeader("X-API-Key",     apiKey);
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
-            root.isLoadingMessages = false;
+            root.messagesInFlight = false;
             if (xhr.status === 200) {
                 try {
                     var r = JSON.parse(xhr.responseText);
-                    var msgs = r.response || r || [];
-                    root.activeChatMessages = msgs;
-                    // Scroll to bottom of message list after updating
-                    Qt.callLater(function() {
-                        if (typeof messageListView !== "undefined" && messageListView) {
-                            messageListView.positionViewAtEnd();
-                        }
-                    });
+                    var fresh = r.response || r || [];
+                    // Cheap change check: skip the (expensive) model swap and
+                    // scroll jump when the poll returned nothing new.
+                    var sig = r.sig || (fresh.length + ":" + (fresh.length ? fresh[fresh.length - 1].id : ""));
+                    if (background && sig === root.lastMsgSig) return;
+                    root.lastMsgSig = sig;
+                    root.pollStreak = 0;
+                    var wasAtEnd = (typeof messageListView !== "undefined" && messageListView && messageListView.atYEnd);
+                    if (useSince) {
+                        root.pollsSinceFull++;
+                        root.activeChatMessages = PollUtils.mergeMessages(existing, fresh);
+                    } else {
+                        root.pollsSinceFull = 0;
+                        root.activeChatMessages = fresh;
+                    }
+                    // Scroll to bottom after updating, but only when the user
+                    // was already reading the latest messages.
+                    if (wasAtEnd) {
+                        Qt.callLater(function() {
+                            if (typeof messageListView !== "undefined" && messageListView) {
+                                messageListView.positionViewAtEnd();
+                            }
+                        });
+                    }
                 } catch(e) {
                     console.log("Parse messages error:", e);
                 }
             }
         };
-        xhr.send(JSON.stringify({ args: { chatId: chatId } }));
+        xhr.send(JSON.stringify({ args: args }));
     }
 
     function sendMessage(chatId, text) {
@@ -240,6 +464,7 @@ PlasmoidItem {
             root.sendInFlight = false;
             if (xhr.status === 200) {
                 root.messageSent(true);
+                root.clearPendingReply();
                 fetchMessages(chatId);
             } else {
                 root.messageSent(false);
@@ -258,10 +483,10 @@ PlasmoidItem {
                 root.activeChatMessages = msgs;
             }
         };
-        xhr.send(JSON.stringify({ args: { to: chatId, content: originalText } }));
+        xhr.send(JSON.stringify({ args: { to: chatId, content: originalText, replyToId: root.pendingReplyId } }));
     }
 
-    function sendFile(chatId, filePath) {
+    function sendFile(chatId, filePath, caption) {
         if (!filePath || root.sendInFlight) return;
         root.sendInFlight = true;
         var xhr = new XMLHttpRequest();
@@ -279,7 +504,7 @@ PlasmoidItem {
                 console.log("Send file failed:", xhr.responseText);
             }
         };
-        xhr.send(JSON.stringify({ args: { to: chatId, filePath: filePath.toString() } }));
+        xhr.send(JSON.stringify({ args: { to: chatId, filePath: filePath.toString(), caption: caption || "" } }));
     }
 
     function restartBackend() {
@@ -296,7 +521,7 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: {} }));
     }
 
-    function sendReaction(chatId, msgId, reaction) {
+    function sendReaction(chatId, msgId, reaction, remove) {
         if (!root.isConnected || !chatId || !msgId || !reaction) return;
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/sendReaction");
@@ -308,11 +533,14 @@ PlasmoidItem {
                 fetchMessages(root.activeChat.id);
             }
         };
-        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction } }));
+        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction, remove: !!remove } }));
     }
 
+    // Paste: save the clipboard image as a DRAFT attachment. It is NOT sent
+    // until the user presses the send button (or Enter).
     function pasteImageFromClipboard() {
-        if (!root.isConnected || !root.activeChat) return;
+        if (!root.isConnected || root.sendInFlight) return;
+        if (!root.activeChat) return;
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/pasteImage");
         xhr.setRequestHeader("Content-Type",  "application/json");
@@ -322,22 +550,38 @@ PlasmoidItem {
             if (xhr.status === 200) {
                 try {
                     var res = JSON.parse(xhr.responseText);
-                    if (res.response === "sent") {
-                        root.messageSent(true);
-                        fetchMessages(root.activeChat.id);
-                    } else {
-                        root.messageSent(false);
-                        messageInput.paste();
+                    if (res.response === "saved" && res.path) {
+                        root.pendingAttachmentPath = res.path;
+                    } else if (res.response === "no_image") {
+                        console.log("No image found in clipboard");
                     }
                 } catch(e) {
-                    root.messageSent(false);
-                    messageInput.paste();
+                    console.log("Paste image error:", e);
                 }
             } else {
-                messageInput.paste();
+                console.log("Paste image failed:", xhr.status, xhr.responseText);
             }
         };
-        xhr.send(JSON.stringify({ args: { to: root.activeChat.id } }));
+        xhr.send(JSON.stringify({ args: { to: root.activeChat ? root.activeChat.id : "" } }));
+    }
+
+    function clearPendingAttachment() {
+        root.pendingAttachmentPath = "";
+    }
+
+    // Send whatever is composed: a pasted image draft (with optional caption
+    // from the input box) and/or plain text.
+    function sendComposed() {
+        if (!root.activeChat || root.sendInFlight) return;
+        var text = root.messageInputRef ? root.messageInputRef.text.trim() : "";
+        if (root.pendingAttachmentPath !== "") {
+            var path = root.pendingAttachmentPath;
+            root.clearPendingAttachment();
+            if (root.messageInputRef) root.messageInputRef.text = "";
+            root.sendFile(root.activeChat.id, path, text);
+        } else if (text.length > 0) {
+            sendMessage(root.activeChat.id, text);
+        }
     }
 
     function filterChats() {
@@ -410,21 +654,35 @@ PlasmoidItem {
         triggeredOnStart: true
         onTriggered: fetchChats()
     }
+    // Fallback retry when the long-poll loop errors (exponential backoff).
     Timer {
-        id: messagePollTimer
-        interval: 5000
-        running:  root.isConnected && root.activeChat !== null
-        repeat:   true
+        id: messageWaitBackoff
+        interval: PollUtils.nextMessagePollInterval(5000, 30000, root.pollStreak)
+        running: false
+        repeat: false
         onTriggered: {
-            if (root.activeChat) {
-                fetchMessages(root.activeChat.id);
+            if (root.activeChat !== null) {
+                fetchMessages(root.activeChat.id, true);
+                messageWaitLoop();
             }
         }
+    }
+    // Debounced search: typing doesn't refilter on every keystroke.
+    Timer {
+        id: searchDebounceTimer
+        interval: PollUtils.debounceDelay(150)
+        running: false
+        repeat: false
+        onTriggered: filterChats()
     }
 
     FileDialog {
         id: fileDialog
         title: "Select an attachment"
+        nameFilters: [
+            "Images and Media (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.mp4 *.mov *.avi)",
+            "All Files (*)"
+        ]
         onAccepted: {
             if (root.activeChat && selectedFile) {
                 sendFile(root.activeChat.id, selectedFile.toString());
@@ -721,7 +979,7 @@ PlasmoidItem {
                             Layout.fillWidth: true
                             color: root.colText
                             background: Item {}
-                            onTextChanged: { root.searchQuery = text; filterChats(); }
+                            onTextChanged: { root.searchQuery = text; searchDebounceTimer.restart(); }
                         }
 
                         PlasmaComponents.ToolButton {
@@ -747,6 +1005,7 @@ PlasmoidItem {
                         width: parent.width
                         model: root.filteredChats
                         spacing: 0
+                        reuseItems: true
 
                         // Empty state
                         PlasmaComponents.Label {
@@ -767,14 +1026,20 @@ PlasmoidItem {
                             MouseArea {
                                 anchors.fill: parent
                                 hoverEnabled: true
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton
                                 onEntered: chatRow.hovered = true
                                 onExited:  chatRow.hovered = false
-                                onClicked: {
-                                    root.activeChat = {
-                                        id:      modelData.id,
-                                        name:    modelData.name || modelData.formattedTitle || "Unknown",
-                                        isGroup: modelData.isGroup || false
-                                    };
+                                onClicked: function(mouse) {
+                                    if (mouse.button === Qt.RightButton) {
+                                        root.contextChat = modelData;
+                                        chatContextMenu.popup(chatRow, mouse.x, mouse.y);
+                                    } else {
+                                        root.activeChat = {
+                                            id:      modelData.id,
+                                            name:    modelData.name || modelData.formattedTitle || "Unknown",
+                                            isGroup: modelData.isGroup || false
+                                        };
+                                    }
                                 }
                             }
 
@@ -784,7 +1049,7 @@ PlasmoidItem {
                                 anchors { fill: parent; leftMargin: 14; rightMargin: 14 }
                                 spacing: 12
 
-                                // Avatar
+                                // Avatar (profile picture with colored-initials fallback)
                                 Rectangle {
                                     width: 44; height: 44; radius: 22
                                     color: root.avatarColor(modelData.name || modelData.formattedTitle || "")
@@ -795,6 +1060,31 @@ PlasmoidItem {
                                         font.bold: !modelData.isGroup
                                         font.pointSize: modelData.isGroup ? 20 : 16
                                         color: "#ffffff"
+                                    }
+
+                                    // Circular mask for the photo (white = visible).
+                                    Rectangle {
+                                        id: avatarMaskShape
+                                        width: 44; height: 44; radius: 22
+                                        visible: false
+                                        color: "#ffffff"
+                                    }
+
+                                    // Avatar photo on top when available.
+                                    Image {
+                                        anchors.fill: parent
+                                        source: root.avatarSource(modelData.id)
+                                        sourceSize.width: 88
+                                        sourceSize.height: 88
+                                        asynchronous: true
+                                        fillMode: Image.PreserveAspectCrop
+                                        visible: source !== ""
+                                        layer.enabled: source !== ""
+                                        layer.smooth: true
+                                        layer.effect: MultiEffect {
+                                            maskEnabled: true
+                                            maskSource: avatarMaskShape
+                                        }
                                     }
 
                                     // Online indicator (if available)
@@ -816,6 +1106,12 @@ PlasmoidItem {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: 4
+
+                                        PlasmaComponents.Label {
+                                            visible: root.isChatPinned(modelData)
+                                            text: "📌"
+                                            font.pointSize: 8
+                                        }
 
                                         PlasmaComponents.Label {
                                             text: modelData.name || modelData.formattedTitle || "Unknown"
@@ -902,7 +1198,7 @@ PlasmoidItem {
                             onClicked: root.activeChat = null
                         }
 
-                        // Recipient avatar
+                        // Recipient avatar (photo with initials fallback)
                         Rectangle {
                             width: 38; height: 38; radius: 19
                             color: root.activeChat ? root.avatarColor(root.activeChat.name) : root.colAccent
@@ -913,6 +1209,29 @@ PlasmoidItem {
                                 font.bold: !root.activeChat || !root.activeChat.isGroup
                                 font.pointSize: root.activeChat && root.activeChat.isGroup ? 18 : 14
                                 color: "#ffffff"
+                            }
+
+                            Rectangle {
+                                id: headerAvatarMask
+                                width: 38; height: 38; radius: 19
+                                visible: false
+                                color: "#ffffff"
+                            }
+
+                            Image {
+                                anchors.fill: parent
+                                source: root.activeChat ? root.avatarSource(root.activeChat.id) : ""
+                                sourceSize.width: 76
+                                sourceSize.height: 76
+                                asynchronous: true
+                                fillMode: Image.PreserveAspectCrop
+                                visible: source !== ""
+                                layer.enabled: source !== ""
+                                layer.smooth: true
+                                layer.effect: MultiEffect {
+                                    maskEnabled: true
+                                    maskSource: headerAvatarMask
+                                }
                             }
                         }
 
@@ -928,13 +1247,8 @@ PlasmoidItem {
                                 elide: Text.ElideRight
                                 Layout.fillWidth: true
                             }
-                            PlasmaComponents.Label {
-                                text: root.activeChat ? root.activeChat.id.split("@")[0] : ""
-                                font.pointSize: 8
-                                color: root.colSub
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
+                            // Subtitle (JID/phone number) intentionally hidden —
+                            // the raw WhatsApp ID under the name was visual noise.
                         }
                     }
                 }
@@ -951,8 +1265,22 @@ PlasmoidItem {
                     ListView {
                         id: messageListView
                         model: root.activeChatMessages
-                        spacing: 8
+                        spacing: 4
                         clip: true
+                        // NOTE: deliberately NO reuseItems here. This delegate's
+                        // height comes from chained implicitHeight bindings
+                        // (bubble → wrapping Text → anchored layouts), and the
+                        // model is a JS array that is replaced on every merge.
+                        // Item recycling keeps stale sizes/bindings and renders
+                        // overlapping, overflowing bubbles.
+
+                        // Always land on the most recent message — but only
+                        // when the user is already at (or near) the bottom, so
+                        // background updates don't yank the scroll position.
+                        onCountChanged: {
+                            if (count > 0 && messageListView.atYEnd) Qt.callLater(messageListView.positionViewAtEnd);
+                        }
+                        onWidthChanged: if (count > 0) Qt.callLater(messageListView.positionViewAtEnd);
 
                         // Placeholder if loading messages
                         PlasmaComponents.Label {
@@ -975,7 +1303,19 @@ PlasmoidItem {
                         delegate: Item {
                             id: msgDelegateRoot
                             width: messageListView.width
-                            height: msgBubbleCol.implicitHeight + 6
+                            // Use the column's full implicit height + padding for
+                            // the reaction button that overflows below the bubble.
+                            height: msgBubbleCol.implicitHeight + 16
+
+                            // Right-click a message -> context menu (Reply / Copy message)
+                            MouseArea {
+                                anchors.fill: parent
+                                acceptedButtons: Qt.RightButton
+                                onClicked: function(mouse) {
+                                    root.contextReplyMsg = modelData;
+                                    msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
+                                }
+                            }
 
                             ColumnLayout {
                                 id: msgBubbleCol
@@ -999,7 +1339,8 @@ PlasmoidItem {
                                             }
                                             return Math.min(messageListView.width * 0.75, w);
                                         }
-                                        height: msgCol.implicitHeight + 12
+                                        implicitHeight: msgCol.implicitHeight + 12
+                                        Layout.preferredHeight: implicitHeight
                                         radius: 8
                                         color: modelData.fromMe ? "#005c4b" : root.colPanel
                                         border.color: root.colBorder
@@ -1019,6 +1360,60 @@ PlasmoidItem {
                                                 color: root.colGreen
                                                 Layout.fillWidth: true
                                                 elide: Text.ElideRight
+                                            }
+
+                                            // Quoted message preview (reply context)
+                                            Rectangle {
+                                                visible: !!(modelData.quotedMsg && modelData.quotedMsg.body)
+                                                Layout.fillWidth: true
+                                                Layout.preferredHeight: quotedCol.implicitHeight + 10
+                                                radius: 4
+                                                color: modelData.fromMe ? "#0a4639" : "#1a2930"
+                                                clip: true
+
+                                                // Green left accent bar
+                                                Rectangle {
+                                                    width: 3
+                                                    anchors { top: parent.top; bottom: parent.bottom; left: parent.left; leftMargin: 0 }
+                                                    radius: 1.5
+                                                    color: root.colAccent
+                                                }
+
+                                                ColumnLayout {
+                                                    id: quotedCol
+                                                    anchors { fill: parent; leftMargin: 8; rightMargin: 6; topMargin: 5; bottomMargin: 5 }
+                                                    spacing: 1
+
+                                                    PlasmaComponents.Label {
+                                                        visible: !!(modelData.quotedMsg && modelData.quotedMsg.senderName)
+                                                        text: (modelData.quotedMsg && modelData.quotedMsg.senderName) || ""
+                                                        font.pointSize: 7
+                                                        font.bold: true
+                                                        color: root.colAccent
+                                                        elide: Text.ElideRight
+                                                        Layout.fillWidth: true
+                                                    }
+
+                                                    PlasmaComponents.Label {
+                                                        text: {
+                                                            if (!modelData.quotedMsg) return "";
+                                                            var qType = modelData.quotedMsg.type || "chat";
+                                                            if (qType === "image") return "📷 Photo";
+                                                            if (qType === "video") return "🎥 Video";
+                                                            if (qType === "audio") return "🎵 Audio";
+                                                            if (qType === "sticker") return "🪄 Sticker";
+                                                            if (qType === "document") return "📄 Document";
+                                                            var b = modelData.quotedMsg.body || "";
+                                                            return b.length > 80 ? b.substring(0, 80) + "…" : b;
+                                                        }
+                                                        font.pointSize: 7.5
+                                                        color: root.colSub
+                                                        elide: Text.ElideRight
+                                                        wrapMode: Text.NoWrap
+                                                        Layout.fillWidth: true
+                                                        maximumLineCount: 1
+                                                    }
+                                                }
                                             }
 
                                             // Message text - with emoji font support
@@ -1103,28 +1498,59 @@ PlasmoidItem {
 
                                 // ── Reactions display row ─────────────────────────────
                                 RowLayout {
+                                    id: reactionsRow
+                                    property string parentMsgId: modelData.id || ""
                                     Layout.leftMargin: modelData.fromMe ? 50 : 14
                                     Layout.rightMargin: modelData.fromMe ? 14 : 50
-                                    spacing: 2
+                                    spacing: 4
                                     visible: modelData.reactions && modelData.reactions.length > 0
 
                                     Repeater {
-                                        model: modelData.reactions || []
+                                        model: MsgUtils.aggregateReactions(modelData.reactions)
                                         Rectangle {
-                                            height: 20
-                                            width: reactLabel.implicitWidth + 10
-                                            radius: 10
-                                            color: root.colPanel
-                                            border.color: root.colBorder
+                                            id: reactChip
+                                            height: 22
+                                            width: reactContentRow.implicitWidth + 12
+                                            radius: 11
+                                            color: modelData.fromMe ? root.colAccentDim : (chipMouse.containsMouse ? root.colBorder : root.colPanel)
+                                            border.color: modelData.fromMe ? root.colAccent : root.colBorder
                                             border.width: 1
 
-                                            Text {
-                                                id: reactLabel
+                                            Behavior on color { ColorAnimation { duration: 100 } }
+
+                                            RowLayout {
+                                                id: reactContentRow
                                                 anchors.centerIn: parent
-                                                text: modelData.emoji || ""
-                                                font.pointSize: 11
-                                                font.family: root.emojiFont
-                                                renderType: Text.QtRendering
+                                                spacing: 3
+
+                                                Text {
+                                                    text: modelData.emoji || ""
+                                                    font.pointSize: 10
+                                                    font.family: root.emojiFont
+                                                    renderType: Text.QtRendering
+                                                }
+
+                                                PlasmaComponents.Label {
+                                                    visible: modelData.count > 1
+                                                    text: modelData.count
+                                                    font.pointSize: 7.5
+                                                    font.bold: true
+                                                    color: root.colText
+                                                }
+                                            }
+
+                                            PlasmaComponents.ToolTip.visible: chipMouse.containsMouse && modelData.senders && modelData.senders.length > 0
+                                            PlasmaComponents.ToolTip.text: modelData.senders ? modelData.senders.join(", ") : ""
+
+                                            MouseArea {
+                                                id: chipMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                onClicked: {
+                                                    if (root.activeChat && reactionsRow.parentMsgId) {
+                                                        root.sendReaction(root.activeChat.id, reactionsRow.parentMsgId, modelData.emoji, modelData.fromMe);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1192,13 +1618,82 @@ PlasmoidItem {
                 // ── Message Input area ─────────────────────────
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 70
+                    height: (root.pendingReplyId !== "" || root.pendingAttachmentPath !== "") ? 92 : 70
                     color: root.colHeader
 
 
                     ColumnLayout {
                         anchors { fill: parent; leftMargin: 10; rightMargin: 10; topMargin: 8; bottomMargin: 8 }
                         spacing: 4
+
+                        // ── "Replying to…" quote bar ──────────────────────────
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            visible: root.pendingReplyId !== ""
+
+                            Rectangle {
+                                width: 3; height: 30; radius: 1.5
+                                color: root.colAccent
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 0
+
+                                PlasmaComponents.Label {
+                                    text: "Replying to"
+                                    font.pointSize: 7
+                                    font.bold: true
+                                    color: root.colAccent
+                                }
+                                PlasmaComponents.Label {
+                                    text: root.replyPreviewLabel
+                                    font.pointSize: 8
+                                    color: root.colSub
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                            }
+
+                            PlasmaComponents.ToolButton {
+                                Layout.preferredWidth: 24
+                                Layout.preferredHeight: 24
+                                text: "✕"
+                                ToolTip.text: "Cancel reply"
+                                ToolTip.visible: hovered
+                                onClicked: root.clearPendingReply()
+                            }
+                        }
+
+                        // ── Pasted-image draft chip (not sent until send is pressed) ──
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            visible: root.pendingAttachmentPath !== ""
+
+                            Rectangle {
+                                width: 3; height: 26; radius: 1.5
+                                color: root.colAccent
+                            }
+
+                            PlasmaComponents.Label {
+                                Layout.fillWidth: true
+                                text: "📷 Image attached — press send to deliver"
+                                font.pointSize: 8
+                                color: root.colText
+                                elide: Text.ElideRight
+                            }
+
+                            PlasmaComponents.ToolButton {
+                                Layout.preferredWidth: 24
+                                Layout.preferredHeight: 24
+                                text: "✕"
+                                ToolTip.text: "Remove attachment"
+                                ToolTip.visible: hovered
+                                onClicked: root.clearPendingAttachment()
+                            }
+                        }
 
                         RowLayout {
                             spacing: 8
@@ -1255,18 +1750,32 @@ PlasmoidItem {
                                         clip: true
                                         contentWidth: width
                                         contentHeight: messageInput.implicitHeight
+                                        flickableDirection: Flickable.VerticalFlick
+                                        boundsBehavior: Flickable.StopAtBounds
+
+                                        // Helper: keep the cursor rectangle visible
+                                        function ensureCursorVisible() {
+                                            var r = messageInput.cursorRectangle;
+                                            // Vertical
+                                            if (r.y < flick.contentY)
+                                                flick.contentY = r.y;
+                                            else if (r.y + r.height > flick.contentY + flick.height)
+                                                flick.contentY = r.y + r.height - flick.height;
+                                        }
 
                                         TextEdit {
                                             id: messageInput
                                             Component.onCompleted: root.messageInputRef = messageInput
                                             width: flick.width
-                                            anchors.verticalCenter: parent.verticalCenter
                                             wrapMode: TextEdit.Wrap
                                             color: root.colText
                                             font.pointSize: 9.5
                                             font.family: root.emojiFont
                                             selectionColor: root.colAccent
                                             focus: true
+
+                                            // Auto-scroll the Flickable whenever the cursor moves
+                                            onCursorRectangleChanged: flick.ensureCursorVisible()
 
                                             Text {
                                                 anchors.fill: parent
@@ -1281,17 +1790,26 @@ PlasmoidItem {
                                                 if (event.modifiers & Qt.ShiftModifier) {
                                                     messageInput.insert(messageInput.cursorPosition, "\n");
                                                 } else {
-                                                    if (root.activeChat && messageInput.text.trim().length > 0) {
-                                                        sendMessage(root.activeChat.id, messageInput.text);
-                                                    }
+                                                    sendComposed();
                                                 }
                                             }
 
 
                                             Keys.onPressed: function(event) {
                                                 if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
-                                                    event.accepted = true;
-                                                    pasteImageFromClipboard();
+                                                    if (event.modifiers & Qt.ShiftModifier) {
+                                                        event.accepted = true;
+                                                        pasteImageFromClipboard();
+                                                    } else {
+                                                        var hadSelection = messageInput.selectedText.length > 0;
+                                                        var oldLen = messageInput.text.length;
+                                                        messageInput.paste();
+                                                        if (!hadSelection && messageInput.text.length === oldLen) {
+                                                            // No text was inserted by Qt paste, check if clipboard contains an image
+                                                            pasteImageFromClipboard();
+                                                        }
+                                                        event.accepted = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1304,10 +1822,10 @@ PlasmoidItem {
                                 width: 36; height: 36
                                 radius: 18
                                 color: {
-                                    if (sendMouseArea.containsMouse && messageInput.text.trim().length > 0 && !root.sendInFlight) return root.colAccentDim;
+                                    if (sendMouseArea.containsMouse && (messageInput.text.trim().length > 0 || root.pendingAttachmentPath !== "") && !root.sendInFlight) return root.colAccentDim;
                                     return root.colAccent;
                                 }
-                                opacity: (messageInput.text.trim().length === 0 || root.sendInFlight) ? 0.5 : 1.0
+                                opacity: ((messageInput.text.trim().length === 0 && root.pendingAttachmentPath === "") || root.sendInFlight) ? 0.5 : 1.0
 
                                 Behavior on color { ColorAnimation { duration: 150 } }
 
@@ -1323,9 +1841,7 @@ PlasmoidItem {
                                     anchors.fill: parent
                                     hoverEnabled: true
                                     onClicked: {
-                                        if (root.activeChat && messageInput.text.trim().length > 0 && !root.sendInFlight) {
-                                            sendMessage(root.activeChat.id, messageInput.text);
-                                        }
+                                        sendComposed();
                                     }
                                 }
                             }
@@ -1418,25 +1934,76 @@ PlasmoidItem {
                         }
                     }
 
+                    // Category Tabs Bar
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 32
+                        color: root.colSurface
+
+                        RowLayout {
+                            anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
+                            spacing: 2
+
+                            Repeater {
+                                model: ["⭐", "😀", "👋", "🐶", "🍎", "🚗", "⚽", "💡"]
+                                Rectangle {
+                                    height: 26
+                                    width: 32
+                                    radius: 4
+                                    color: index === root.selectedEmojiCategory ? root.colAccentDim : (catHover.containsMouse ? root.colPanel : "transparent")
+                                    border.color: index === root.selectedEmojiCategory ? root.colAccent : "transparent"
+                                    border.width: 1
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: modelData
+                                        font.pointSize: 12
+                                        font.family: root.emojiFont
+                                        renderType: Text.QtRendering
+                                    }
+
+                                    MouseArea {
+                                        id: catHover
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        onClicked: root.selectedEmojiCategory = index
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
-                    // Scrolling emoji grid
+                    // Scrolling vertical emoji grid
                     PlasmaComponents.ScrollView {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
 
-                        ListView {
+                        GridView {
                             id: emojiGrid
                             anchors.fill: parent
-                            model: root.emojiList
-                            spacing: 0
-                            orientation: ListView.Horizontal
-                            layoutDirection: Qt.LeftToRight
-                            snapMode: ListView.SnapToItem
+                            anchors.margins: 4
+                            cellWidth: 38
+                            cellHeight: 38
+                            flow: GridView.FlowLeftToRight
+                            clip: true
+
+                            model: {
+                                if (root.selectedEmojiCategory === 0) return root.emojiList;
+                                if (root.selectedEmojiCategory === 1) return root.emojiList.slice(0, 80);
+                                if (root.selectedEmojiCategory === 2) return root.emojiList.slice(80, 160);
+                                if (root.selectedEmojiCategory === 3) return root.emojiList.slice(220, 310);
+                                if (root.selectedEmojiCategory === 4) return root.emojiList.slice(310, 410);
+                                if (root.selectedEmojiCategory === 5) return root.emojiList.slice(410, 500);
+                                if (root.selectedEmojiCategory === 6) return root.emojiList.slice(500, 563);
+                                if (root.selectedEmojiCategory === 7) return root.emojiList.slice(563);
+                                return root.emojiList;
+                            }
 
                             delegate: Rectangle {
-                                width: 38; height: 38
+                                width: 36; height: 36
                                 color: emojiItemHover.containsMouse ? root.colAccentDim : "transparent"
                                 radius: 4
 
@@ -1471,6 +2038,72 @@ PlasmoidItem {
                     }
                 }
             }
+        }
+    }
+// Pure-QML clipboard helper (TextEdit.selectAll + copy)
+    TextEdit {
+        id: clipTextEdit
+        visible: false
+        width: 0; height: 0
+    }
+
+    // Right-click context menu for messages
+    Menu {
+        id: msgContextMenu
+        title: "Message"
+
+        MenuItem {
+            text: "Reply"
+            icon.name: "mail-reply-sender"
+            onClicked: root.startReplyFromContext()
+        }
+        MenuItem {
+            text: "Copy message"
+            icon.name: "edit-copy"
+            onClicked: root.copyContextMessage()
+        }
+    }
+
+    // Right-click context menu for chat list rows
+    Menu {
+        id: chatContextMenu
+        title: "Chat"
+
+        MenuItem {
+            text: (root.contextChat && root.isChatPinned(root.contextChat)) ? "Unpin Chat" : "Pin Chat"
+            icon.name: "bookmark-new"
+            onClicked: {
+                if (root.contextChat) {
+                    root.togglePinChat(root.contextChat.id);
+                }
+            }
+        }
+    }
+
+    // "Copied" toast
+    Timer {
+        id: copyToastTimer
+        interval: 1200
+        onTriggered: root.copyToastVisible = false
+    }
+
+    Rectangle {
+        id: copyToast
+        visible: root.copyToastVisible
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 80
+        width: 88; height: 28; radius: 14
+        color: "#2a363c"
+        border.color: root.colBorder
+        border.width: 1
+        z: 99
+
+        PlasmaComponents.Label {
+            anchors.centerIn: parent
+            text: "Copied!"
+            font.pointSize: 8
+            color: root.colText
         }
     }
 }
