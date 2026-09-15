@@ -19,6 +19,7 @@ const replyLib = require('./lib/reply');
 const avatarsLib = require('./lib/avatars');
 const messagesLib = require('./lib/messages');
 const pinsLib = require('./lib/pins');
+const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
 const fs = require('fs');
@@ -101,6 +102,21 @@ async function getValidPage() {
 }
 
 
+// ── Lost-auth detection ──────────────────────────────────────────────────────
+// True when the page is showing the WhatsApp login/QR screen instead of an
+// authenticated chat list. Used by getAllChats to catch sessions that WhatsApp
+// has logged out (the widget then resets the flow via POST /api/logout).
+async function pageIsLoggedOut(waPage) {
+    try {
+        return await waPage.evaluate(() => {
+            const tids = Array.from(document.querySelectorAll('[data-testid]'))
+                .map(el => el.getAttribute('data-testid') || '');
+            return tids.some(t => t.indexOf('link-device') === 0 || t.indexOf('link_device') === 0);
+        });
+    } catch (_) { return false; }
+}
+
+
 // ── Webpack module helper (injected once into the page) ──────────────────────
 // WhatsApp Web uses webpack - window.Store doesn't exist, we must use require()
 const STORE_INJECT_JS = `
@@ -137,7 +153,11 @@ const STORE_INJECT_JS = `
 `;
 
 // ── Status endpoint (NO auth required — health check) ───────────────────────
-app.get('/api/status', (_req, res) => res.json({ ready: isReady }));
+app.get('/api/status', (_req, res) => {
+    let hasQr = false;
+    try { hasQr = fs.existsSync(QR_PATH); } catch (_) { hasQr = false; }
+    res.json({ ready: isReady, hasQr });
+});
 
 // ── Auth middleware (applies to all routes below this line) ─────────────────
 app.use((req, res, next) => {
@@ -146,20 +166,41 @@ app.use((req, res, next) => {
     next();
 });
 
-// ── getAllChats ──────────────────────────────────────────────────────────────
-app.post('/api/getAllChats', async (req, res) => {
-    try {
-        const page = await getValidPage();
-        if (!isReady || !page) return res.status(503).json({ error: 'Not ready' });
-        const chats = await page.evaluate(() => {
+// ── getAllChats: page-side extraction (self-contained) ──────────────────────
+// Runs inside the WhatsApp page. Must not reference module scope — it is
+// serialized into the page via toString (see the route below), matching the
+// lib/avatars.js pattern. The two helpers are injected the same way.
+function getAllChatsInPage(extractLastMessage, extractChatListRows) {
 
-            // ── Method 1: WAWebChatCollection singleton ──────────────────────
+    // ── Method 1: WAWebChatCollection singleton ──────────────────────────
+    try {
+        const mod = window.require('WAWebChatCollection');
+        // Try ChatCollection (often the singleton Backbone collection)
+        const coll = mod.ChatCollection || mod.ChatCollectionImpl;
+        if (coll && typeof coll.getModelsArray === 'function') {
+            return coll.getModelsArray().map(c => ({
+                id: c.id && c.id._serialized || String(c.id),
+                name: c.formattedTitle || c.name || '',
+                formattedTitle: c.formattedTitle || '',
+                isGroup: !!c.isGroup,
+                isPinned: !!(c.pin || c.isPinned),
+                unreadCount: c.unreadCount || 0,
+                t: c.t || 0,
+                lastMessage: extractLastMessage(c),
+            }));
+        }
+    } catch (e) { }
+
+    // ── Method 2: WAWebStore or WAWebStoreService ────────────────────────
+    try {
+        const storeNames = ['WAWebStore', 'WAWebStoreService',
+            'WAWebChatListBus', 'WAWebOrderedChatListBus'];
+        for (const name of storeNames) {
             try {
-                const mod = window.require('WAWebChatCollection');
-                // Try ChatCollection (often the singleton Backbone collection)
-                const coll = mod.ChatCollection || mod.ChatCollectionImpl;
-                if (coll && typeof coll.getModelsArray === 'function') {
-                    return coll.getModelsArray().map(c => ({
+                const m = window.require(name);
+                const d = m && (m.default || m);
+                if (d && typeof d.getModelsArray === 'function') {
+                    return d.getModelsArray().map(c => ({
                         id: c.id && c.id._serialized || String(c.id),
                         name: c.formattedTitle || c.name || '',
                         formattedTitle: c.formattedTitle || '',
@@ -167,123 +208,106 @@ app.post('/api/getAllChats', async (req, res) => {
                         isPinned: !!(c.pin || c.isPinned),
                         unreadCount: c.unreadCount || 0,
                         t: c.t || 0,
-                        lastMessage: c.lastMessage ? {
-                            body: c.lastMessage.body || '',
-                            type: c.lastMessage.type || 'chat',
-                            t: c.lastMessage.t || 0,
-                            fromMe: !!(c.lastMessage.id && c.lastMessage.id.fromMe),
-                        } : null,
+                        lastMessage: extractLastMessage(c),
                     }));
                 }
-                // Try as a class: look for static methods or a default export
-                if (mod.ChatCollection && mod.ChatCollection.prototype &&
-                    typeof mod.ChatCollection.prototype.getModelsArray === 'function') {
-                    // It's a class — find the global instance via store registry
-                }
-            } catch (e) { }
+            } catch (_) { }
+        }
+    } catch (e) { }
 
-            // ── Method 2: WAWebStore or WAWebStoreService ────────────────────
-            try {
-                const storeNames = ['WAWebStore', 'WAWebStoreService',
-                    'WAWebChatListBus', 'WAWebOrderedChatListBus'];
-                for (const name of storeNames) {
-                    try {
-                        const m = window.require(name);
-                        const d = m && (m.default || m);
-                        if (d && typeof d.getModelsArray === 'function') {
-                            return d.getModelsArray().map(c => ({
-                                id: c.id && c.id._serialized || String(c.id),
-                                name: c.formattedTitle || c.name || '',
-                                formattedTitle: c.formattedTitle || '',
-                                isGroup: !!c.isGroup,
-                                isPinned: !!(c.pin || c.isPinned),
-                                unreadCount: c.unreadCount || 0,
-                                t: c.t || 0,
-                                lastMessage: c.lastMessage ? {
-                                    body: c.lastMessage.body || '',
-                                    type: c.lastMessage.type || 'chat', t: c.lastMessage.t || 0,
-                                    fromMe: !!(c.lastMessage.id && c.lastMessage.id.fromMe),
-                                } : null,
-                            }));
-                        }
-                    } catch (_) { }
-                }
-            } catch (e) { }
-
-            // ── Method 3: React Fiber traversal on chat list ─────────────────
-            try {
-                const chatList = document.querySelector('#pane-side') ||
-                    document.querySelector('[data-testid="chat-list"]');
-                if (chatList) {
-                    // Find React fiber key
-                    const fiberKey = Object.keys(chatList).find(k =>
-                        k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-                    if (fiberKey) {
-                        // Walk fiber tree to find chat model data
-                        const results = [];
-                        let fiber = chatList[fiberKey];
-                        const seen = new Set();
-                        let depth = 0;
-                        function walk(f) {
-                            if (!f || depth > 200 || seen.has(f)) return;
-                            seen.add(f);
-                            depth++;
-                            // Look for memoizedProps containing chat-like data
-                            const props = f.memoizedProps;
-                            if (props) {
-                                const chat = props.chat || props.model;
-                                if (chat && chat.id && chat.id._serialized &&
-                                    !seen.has(chat.id._serialized)) {
-                                    seen.add(chat.id._serialized);
-                                    results.push({
-                                        id: chat.id._serialized,
-                                        name: chat.formattedTitle || chat.name || '',
-                                        formattedTitle: chat.formattedTitle || '',
-                                        isGroup: !!chat.isGroup,
-                                        isPinned: !!(chat.pin || chat.isPinned),
-                                        unreadCount: chat.unreadCount || 0,
-                                        t: chat.t || 0,
-                                        lastMessage: chat.lastMessage ? {
-                                            body: chat.lastMessage.body || '',
-                                            type: chat.lastMessage.type || 'chat',
-                                            t: chat.lastMessage.t || 0,
-                                            fromMe: !!(chat.lastMessage.id && chat.lastMessage.id.fromMe),
-                                        } : null,
-                                    });
-                                }
-                            }
-                            if (results.length >= 50) return; // cap
-                            walk(f.child);
-                            walk(f.sibling);
-                        }
-                        walk(fiber);
-                        if (results.length > 0) return results;
-                    }
-                }
-            } catch (e) { }
-
-            // ── Method 4: DOM scrape (name-only fallback, no IDs) ────────────
-            try {
-                const rows = document.querySelectorAll('[data-testid="cell-frame-container"]');
+    // ── Method 3: React Fiber traversal on chat list ─────────────────────
+    try {
+        const chatList = document.querySelector('#pane-side') ||
+            document.querySelector('[data-testid="chat-list"]');
+        if (chatList) {
+            // Find React fiber key
+            const fiberKey = Object.keys(chatList).find(k =>
+                k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+            if (fiberKey) {
+                // Walk fiber tree to find chat model data
                 const results = [];
-                rows.forEach(row => {
-                    const nameEl = row.querySelector('[data-testid="cell-frame-title"] span') ||
-                        row.querySelector('span[title]');
-                    const name = nameEl ? (nameEl.title || nameEl.textContent || '') : '';
-                    if (name) {
-                        results.push({
-                            id: 'dom_' + name.replace(/\s+/g, '_'),
-                            name: name, formattedTitle: name,
-                            isGroup: false, unreadCount: 0, t: 0, lastMessage: null,
-                        });
+                let fiber = chatList[fiberKey];
+                const seen = new Set();
+                let depth = 0;
+                function walk(f) {
+                    if (!f || depth > 200 || seen.has(f)) return;
+                    seen.add(f);
+                    depth++;
+                    // Look for memoizedProps containing chat-like data
+                    const props = f.memoizedProps;
+                    if (props) {
+                        const chat = props.chat || props.model;
+                        if (chat && chat.id && chat.id._serialized &&
+                            !seen.has(chat.id._serialized)) {
+                            seen.add(chat.id._serialized);
+                            results.push({
+                                id: chat.id._serialized,
+                                name: chat.formattedTitle || chat.name || '',
+                                formattedTitle: chat.formattedTitle || '',
+                                isGroup: !!chat.isGroup,
+                                isPinned: !!(chat.pin || chat.isPinned),
+                                unreadCount: chat.unreadCount || 0,
+                                t: chat.t || 0,
+                                lastMessage: extractLastMessage(chat),
+                            });
+                        }
                     }
-                });
-                return results;
-            } catch (e) { }
+                    if (results.length >= 50) return; // cap
+                    walk(f.child);
+                    walk(f.sibling);
+                }
+                walk(fiber);
+                if (results.length > 0) return results;
+            }
+        }
+    } catch (e) { }
 
-            return [];
-        });
-        console.log(`getAllChats: returned ${chats.length} chats`);
+    // ── Method 4: DOM scrape (ID-less fallback: name + subtitle) ─────────
+    try {
+        const rows = extractChatListRows(document);
+        const results = rows.map(r => ({
+            id: 'dom_' + r.name.replace(/\s+/g, '_'),
+            name: r.name, formattedTitle: r.name,
+            isGroup: false, unreadCount: 0, t: 0,
+            lastMessage: r.body ? {
+                body: r.body, type: 'chat', t: 0,
+                fromMe: false, isRevoked: false, senderName: '',
+            } : null,
+        }));
+        if (results.length > 0) return results;
+    } catch (e) { }
+
+    return [];
+}
+
+// ── getAllChats ──────────────────────────────────────────────────────────────
+app.post('/api/getAllChats', async (req, res) => {
+    try {
+        const page = await getValidPage();
+        if (!isReady || !page) return res.status(503).json({ error: 'Not ready' });
+
+        // Lost-auth guard: if the page shows the login/QR screen the session is
+        // dead even though we believed we were ready. Drop back to the QR flow
+        // and tell the widget (which triggers its auto-logout recovery).
+        if (await pageIsLoggedOut(page)) {
+            console.log('[AUTH] Login screen detected while marked ready — session lost.');
+            isReady = false;
+            currentOpenChatId = null;
+            msgCache.clear();
+            try { fs.unlinkSync(QR_PATH); } catch (_) { }
+            waitForAppOrQR();
+            return res.status(401).json({ error: 'Logged out', code: 'AUTH_LOST' });
+        }
+        // NOTE: this puppeteer-core build does not serialize function
+        // arguments into page.evaluate (they arrive undefined and every
+        // extraction method dies silently). Inject the self-contained page
+        // helpers via toString instead — same pattern as lib/avatars.js.
+        const chats = await page.evaluate(new Function(
+            'return (' + getAllChatsInPage.toString() + ')(' +
+                chatPreviewLib.extractLastMessage.toString() + ',' +
+                chatPreviewLib.extractChatListRows.toString() + ');'));
+        const withPreview = chats.filter(c => c.lastMessage && c.lastMessage.body).length;
+        console.log(`getAllChats: returned ${chats.length} chats (${withPreview} with preview)`);
         res.json({ response: chats });
     } catch (e) {
         console.error('getAllChats error:', e.message);
@@ -727,8 +751,17 @@ app.post('/api/getChatMessages', async (req, res) => {
 
         // Serve from cache when the previous scrape is younger than the TTL.
         const since = messagesLib.parseSince(args.since);
+        const wantsBefore = args.beforeId != null && args.beforeId !== '';
+        const limitGiven = Number(args.limit) > 0;
+        const pageArgs = (wantsBefore || limitGiven)
+            ? { limit: args.limit, beforeId: wantsBefore ? args.beforeId : undefined, beforeT: args.beforeT }
+            : null;
         const cached = msgCache.get(chatId);
         if (cached && (Date.now() - cached.t) < MSG_CACHE_TTL_MS) {
+            if (pageArgs && !since) {
+                const p = messagesLib.paginateMessages(cached.messages, pageArgs);
+                return res.json({ response: p.page, sig: cached.sig, hasMore: p.hasMore });
+            }
             const out = since ? messagesLib.filterMessagesSince(cached.messages, since) : cached.messages;
             return res.json({ response: out, sig: cached.sig });
         }
@@ -740,6 +773,10 @@ app.post('/api/getChatMessages', async (req, res) => {
         const lastMsg = messages.length ? messages[messages.length - 1] : {};
         const sig = messages.length + ':' + (lastMsg.id || '') + ':' + (lastMsg.t || 0);
         msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages });
+        if (pageArgs && !since) {
+            const p = messagesLib.paginateMessages(messages, pageArgs);
+            return res.json({ response: p.page, sig: sig, hasMore: p.hasMore });
+        }
         const out = since ? messagesLib.filterMessagesSince(messages, since) : messages;
         res.json({ response: out, sig: sig });
     } catch (e) {
@@ -861,6 +898,19 @@ app.get('/api/avatar/:hash', (req, res) => {
     res.set('Content-Type', isPng ? 'image/png' : 'image/jpeg');
     res.set('Cache-Control', 'private, max-age=86400, immutable');
     res.send(buf);
+});
+
+// ── QR code bytes (GET, key via query so QML Image can pass ?key=) ──────────
+app.get('/api/qr', (req, res) => {
+    try {
+        if (!fs.existsSync(QR_PATH)) return res.status(404).json({ error: 'No QR available' });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'no-store');
+        res.set('Pragma', 'no-cache');
+        return res.sendFile(QR_PATH);
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
+    }
 });
 
 // ── debug: inspect chat-list DOM for avatar scraping ────────────────────────
@@ -1742,6 +1792,34 @@ app.post('/api/restart', async (req, res) => {
     }
 });
 
+// ── Logout / auth reset ──────────────────────────────────────────────────────
+// Drops the backend back to the QR login flow: clears in-memory session state,
+// deletes any stale QR file, reloads WhatsApp Web (a fresh QR appears if the
+// session is really dead; the app re-readies itself if it wasn't), and
+// restarts the QR watcher. Called by the widget's auto-logout recovery.
+app.post('/api/logout', async (_req, res) => {
+    try {
+        console.log('[AUTH] Logout requested — resetting to QR login flow.');
+        isReady = false;
+        currentOpenChatId = null;
+        msgCache.clear();
+        avatarStore.clear();
+        try { fs.unlinkSync(QR_PATH); } catch (_) { }
+        if (waPage) {
+            try {
+                await waPage.goto('https://web.whatsapp.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            } catch (e) {
+                console.log('[AUTH] Page reload failed:', e.message);
+            }
+        }
+        waitForAppOrQR();
+        res.json({ response: 'logged_out' });
+    } catch (e) {
+        console.error('logout error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 
 
 async function launch() {
@@ -1795,7 +1873,11 @@ async function launch() {
     waitForAppOrQR();
 }
 
+let qrWatcherRunning = false; // guards against duplicate QR/ready watchers
+
 async function waitForAppOrQR() {
+    if (qrWatcherRunning) return; // already watching — don't spawn a second interval
+    qrWatcherRunning = true;
     let qrPolled = false;
     let tick = 0;
 
@@ -1813,6 +1895,24 @@ async function waitForAppOrQR() {
                 }).catch(() => ({ url: 'unknown', testids: [], bodyText: '' }));
                 console.log(`[POLL ${tick}] URL: ${domInfo.url}`);
                 console.log(`[POLL ${tick}] data-testid attrs:`, domInfo.testids.join(', ') || 'none');
+            }
+
+            // Expired QR: WhatsApp stops rotating the canvas once it expires
+            // and shows a refresh button instead. Scanning the stale canvas
+            // makes the phone say "Couldn't link device, please try again
+            // later" — so click refresh, drop the stale file (the widget falls
+            // back to "Waiting for QR code…"), and grab the fresh canvas next
+            // tick.
+            const expired = await waPage.evaluate(() => {
+                const btn = document.querySelector('[data-testid="link_device_qr_expired_refresh_button"]')
+                    || document.querySelector('[data-testid="refresh-large"]');
+                if (btn) { btn.click(); return true; }
+                return false;
+            });
+            if (expired && !isReady) {
+                try { fs.unlinkSync(QR_PATH); } catch (_) { }
+                console.log('[QR] Expired QR detected — clicked refresh; waiting for fresh code.');
+                return;
             }
 
             // Check for QR canvas
@@ -1835,8 +1935,14 @@ async function waitForAppOrQR() {
                 return;
             }
 
-            // Check if app is ready — very broad set of selectors
+            // Check if app is ready — very broad set of selectors.
+            // NOTE: the login/QR screen also renders data-testids
+            // (link-device-qr-code etc.), so we must exclude it before
+            // declaring "ready" — otherwise the backend marks itself
+            // authenticated while WhatsApp is actually logged out.
             const readyInfo = await waPage.evaluate(() => {
+                const tids = Array.from(document.querySelectorAll('[data-testid]'))
+                    .map(el => el.getAttribute('data-testid') || '');
                 const checks = {
                     pane_side: !!document.getElementById('pane-side'),
                     chat_list: !!document.querySelector('[data-testid="chat-list"]'),
@@ -1844,23 +1950,27 @@ async function waitForAppOrQR() {
                     app: !!document.getElementById('app'),
                     has_webpack: typeof window.webpackChunkwhatsapp_web_client !== 'undefined',
                     has_wapi: typeof window.WAPI !== 'undefined',
-                    any_testid: document.querySelector('[data-testid]') !== null,
+                    any_testid: tids.length > 0,
+                    login_screen: tids.some(t => t.indexOf('link-device') === 0 || t.indexOf('link_device') === 0),
                 };
                 return checks;
             });
 
-            if (!isReady && (readyInfo.pane_side || readyInfo.chat_list || readyInfo.aria_list)) {
+            if (!isReady && !readyInfo.login_screen && (readyInfo.pane_side || readyInfo.chat_list || readyInfo.aria_list)) {
                 clearInterval(qrTimer);
+                qrWatcherRunning = false;
                 isReady = true;
                 try { fs.unlinkSync(QR_PATH); } catch (_) { }
                 console.log('='.repeat(60));
                 console.log('[READY] WhatsApp Web authenticated and ready!');
                 console.log('[READY] Selectors matched:', JSON.stringify(readyInfo));
                 console.log('='.repeat(60));
-            } else if (!isReady && readyInfo.has_webpack && readyInfo.any_testid) {
-                // Webpack loaded and something's rendered — be optimistic
+            } else if (!isReady && !readyInfo.login_screen && readyInfo.has_webpack && readyInfo.any_testid) {
+                // Webpack loaded and something's rendered (and it is NOT the
+                // login screen) — be optimistic.
                 console.log('[READY?] Webpack loaded, assuming ready. Info:', JSON.stringify(readyInfo));
                 clearInterval(qrTimer);
+                qrWatcherRunning = false;
                 isReady = true;
                 try { fs.unlinkSync(QR_PATH); } catch (_) { }
             }

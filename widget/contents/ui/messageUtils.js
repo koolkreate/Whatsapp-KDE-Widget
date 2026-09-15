@@ -83,6 +83,80 @@ function aggregateReactions(raw) {
     return out;
 }
 
+// Thumbnail-safe copy for the MRU chat cache: replace huge base64 media
+// bodies (> maxLen chars) with a lightweight placeholder so cached copies
+// stay small. Small payloads and text bodies are kept as-is.
+function thumbnailize(msg, maxLen) {
+    if (!msg || typeof msg !== 'object') return msg;
+    var body = typeof msg.body === 'string' ? msg.body : '';
+    if (body.length <= (maxLen > 0 ? maxLen : 4096)) return msg;
+    var copy = {};
+    for (var k in msg) copy[k] = msg[k];
+    copy._thumb = true;
+    copy.body = '';
+    return copy;
+}
+
+// Build a data-URL for a media message body (extracted from the QML
+// msgImage.source logic). Returns '' when there is nothing renderable.
+function mediaSource(msg) {
+    if (!msg) return '';
+    var b = typeof msg.body === 'string' ? msg.body : '';
+    if (!b) return '';
+    if (b.indexOf('data:') === 0) return b;
+    var prefix = 'data:image/jpeg;base64,';
+    if (b.indexOf('iVBORw0KGgo') === 0) prefix = 'data:image/png;base64,';
+    return prefix + b;
+}
+
+// All viewable media messages (image/video/sticker/base64 stills) in chat
+// order — used for the fullscreen viewer's list and prev/next navigation.
+// Thumbnail placeholders are skipped (no renderable body).
+function buildMediaList(msgs) {
+    const out = [];
+    const list = Array.isArray(msgs) ? msgs : [];
+    for (let i = 0; i < list.length; i++) {
+        const m = list[i];
+        if (!m || m._thumb) continue;
+        const b = typeof m.body === 'string' ? m.body : '';
+        const looksMedia = b.indexOf('/9j/') === 0 || b.indexOf('data:image') === 0 ||
+                           b.indexOf('iVBORw0KGgo') === 0;
+        if (m.type === 'image' || m.type === 'video' || m.type === 'sticker' || looksMedia) {
+            out.push(m);
+        }
+    }
+    return out;
+}
+
+// Recency key for chat ordering. Any activity (inbound OR outbound) bumps a
+// chat — matches WhatsApp's bump-on-any-activity behaviour.
+function chatRecency(c) {
+    if (!c) return 0;
+    var t1 = Number(c.t || 0);
+    var t2 = (c.lastMessage && Number(c.lastMessage.t)) || 0;
+    return Math.max(t1, t2);
+}
+
+// Chat list comparator: pinned first, then most recent activity, then name-asc
+// as a stable tiebreak. `isPinned` is an injectable resolver (QML passes
+// root.isChatPinned, which consults both chat.isPinned and the pins list).
+function compareChats(a, b, isPinned) {
+    function pinned(x) {
+        if (typeof isPinned === 'function') return !!isPinned(x);
+        return !!(x && x.isPinned);
+    }
+    var pa = pinned(a) ? 1 : 0;
+    var pb = pinned(b) ? 1 : 0;
+    if (pa !== pb) return pb - pa;
+    var ra = chatRecency(a), rb = chatRecency(b);
+    if (ra > rb) return -1;
+    if (ra < rb) return 1;
+    var na = String((a && (a.name || a.formattedTitle)) || '').toLowerCase();
+    var nb = String((b && (b.name || b.formattedTitle)) || '').toLowerCase();
+    if (na !== nb) return na < nb ? -1 : 1;
+    return 0;
+}
+
 // Node export (ignored by QML, where `module` is undefined).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
@@ -90,6 +164,11 @@ if (typeof module !== 'undefined' && module.exports) {
         mediaLabel: mediaLabel,
         copyTextForMessage: copyTextForMessage,
         replyPreviewText: replyPreviewText,
-        aggregateReactions: aggregateReactions
+        aggregateReactions: aggregateReactions,
+        chatRecency: chatRecency,
+        compareChats: compareChats,
+        thumbnailize: thumbnailize,
+        mediaSource: mediaSource,
+        buildMediaList: buildMediaList
     };
 }

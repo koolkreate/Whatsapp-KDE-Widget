@@ -22,3 +22,8 @@ eval_payload.json
 .idea/
 .DS_Store
 .antigravity*
+
+# Markdown & HTML files
+*.md
+*.html
+

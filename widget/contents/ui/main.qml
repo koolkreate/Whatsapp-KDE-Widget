@@ -30,6 +30,8 @@ PlasmoidItem {
     property bool   isLoadingMessages: false
     property bool   isConnected:  false
     property bool   isLoading:    false
+    property bool   hasQrCode:    false
+    property int    qrSeq:        0
     property string statusMessage: "Connecting to backend…"
     property int    totalUnread:  0
     property bool   sendInFlight: false
@@ -37,6 +39,8 @@ PlasmoidItem {
     property bool   messagesInFlight: false
     property string lastMsgSig: ""   // change signature of the open chat
     property int    pollStreak: 0          // consecutive unchanged polls (backoff)
+    property int    authFailStreak: 0      // consecutive data-load failures (auth watch)
+    property bool   autoLogoutInFlight: false // /api/logout request guard
     property int    pollsSinceFull: 0      // incremental fetches since last full refresh
     property bool   waitLoopRunning: false // long-poll chain guard
     property var    chatAvatarHashes: ({}) // chatId -> avatar hash
@@ -50,6 +54,17 @@ PlasmoidItem {
     property var    pinnedChats: []        // list of pinned chat IDs
     property string pendingAttachmentPath: "" // pasted image waiting to be sent
     property bool   copyToastVisible: false
+
+    // ── Lazy-load + MRU cache + media viewer (Slices 2–4) ────────────────────
+    property int    chatsShown: 20          // chat-list window size (scroll grows it)
+    property bool   msgsHasMore: false      // older messages exist for the open chat
+    property bool   msgsLoadingOlder: false // top-edge page in flight
+    property string msgsTopError: ""        // failed top-edge page (retry row)
+    property var    msgCache: ({})          // chatId -> { messages, sig, savedAt } (MRU-3)
+    property var    mruOrder: []            // most-recent-first chatIds, max 3
+    property bool   viewerVisible: false    // fullscreen media overlay
+    property var    mediaList: []           // viewable media msgs of the open chat
+    property int    mediaIndex: 0
 
     function isChatPinned(chat) {
         if (!chat) return false;
@@ -68,13 +83,7 @@ PlasmoidItem {
             return;
         }
         root.allChats.sort(function(a, b) {
-            var pa = root.isChatPinned(a) ? 1 : 0, pb = root.isChatPinned(b) ? 1 : 0;
-            if (pa !== pb) return pb - pa;
-            var ua = a.unreadCount || 0, ub = b.unreadCount || 0;
-            if (ua !== ub) return ub - ua;
-            var ta = (a.t || a.lastMessage && a.lastMessage.t) || 0;
-            var tb = (b.t || b.lastMessage && b.lastMessage.t) || 0;
-            return tb - ta;
+            return MsgUtils.compareChats(a, b, root.isChatPinned);
         });
         filterChats();
     }
@@ -126,10 +135,26 @@ PlasmoidItem {
         root.lastMsgSig = "";
         root.pollStreak = 0;
         root.pollsSinceFull = 0;
+        root.msgsTopError = "";
         if (activeChat !== null) {
-            root.activeChatMessages = [];
-            fetchMessages(activeChat.id);
+            root.mruTouch(activeChat.id);
+            var cached = root.msgCache[activeChat.id];
+            if (cached && cached.messages && cached.messages.length > 0) {
+                // MRU hit: paint the cached copy instantly, then revalidate in
+                // the background — never present stale data as final.
+                root.activeChatMessages = cached.messages;
+                root.msgsHasMore = true;
+                root.isLoadingMessages = false;
+                fetchMessages(activeChat.id);
+            } else {
+                root.activeChatMessages = [];
+                root.msgsHasMore = false;
+                fetchMessages(activeChat.id);
+            }
             messageWaitLoop();
+        } else {
+            root.activeChatMessages = [];
+            root.msgsHasMore = false;
         }
     }
 
@@ -181,13 +206,34 @@ PlasmoidItem {
     function lastPreview(chat) {
         var msg = chat.lastMessage;
         if (!msg) return "";
-        if (msg.type === "image")    return "📷 Photo";
-        if (msg.type === "video")    return "🎥 Video";
-        if (msg.type === "audio")    return "🎵 Audio";
-        if (msg.type === "document") return "📄 Document";
-        if (msg.type === "sticker")  return "🪄 Sticker";
-        var body = msg.body || msg.content || "";
-        return body.length > 48 ? body.substring(0, 48) + "…" : body;
+        if (msg.isRevoked) return "🚫 Deleted message";
+
+        // Media type icons (caption shown alongside when present).
+        var mediaLabel = "";
+        if (msg.type === "image")         mediaLabel = "📷 Photo";
+        else if (msg.type === "video")    mediaLabel = "🎥 Video";
+        else if (msg.type === "audio" || msg.type === "ptt") mediaLabel = "🎵 Audio";
+        else if (msg.type === "document") mediaLabel = "📄 Document";
+        else if (msg.type === "sticker")  mediaLabel = "🪄 Sticker";
+
+        var body = msg.caption || msg.body || msg.content || "";
+        var text;
+        if (mediaLabel !== "") {
+            text = body !== "" ? mediaLabel + " " + body : mediaLabel;
+        } else {
+            text = body;
+        }
+
+        // Group chats: prefix the sender for incoming messages ("Ada: hello").
+        if (!msg.fromMe && chat.isGroup && msg.senderName && text !== "") {
+            text = msg.senderName + ": " + text;
+        }
+        // Own messages: minimal "sent" tick prefix.
+        if (msg.fromMe && text !== "") {
+            text = "✓ " + text;
+        }
+
+        return text.length > 48 ? text.substring(0, 48) + "…" : text;
     }
 
     // ── Reply & copy helpers ──────────────────────────────────────────────────
@@ -230,11 +276,13 @@ PlasmoidItem {
                     var res = JSON.parse(xhr.responseText);
                     if (res.ready) {
                         root.isConnected = true;
+                        root.hasQrCode = false;
                         root.statusMessage = "";
                         fetchPinnedChats();
                         fetchChats();
                     } else {
                         root.isConnected = false;
+                        root.hasQrCode = !!res.hasQr;
                         root.statusMessage = "Backend starting up…\nScan QR code to link WhatsApp.";
                     }
                 } catch(e) {
@@ -247,6 +295,40 @@ PlasmoidItem {
             }
         };
         xhr.send();
+    }
+
+    // ── Auto-logout / auth recovery ──────────────────────────────────────────
+    // When data loads fail because the WhatsApp session lost auth (401 from
+    // the backend, or repeated 5xx while connected), reset the backend to the
+    // QR login flow and drop the widget back to the connection screen so a
+    // fresh QR can be scanned.
+    function triggerAutoLogout() {
+        if (root.autoLogoutInFlight) return;
+        root.autoLogoutInFlight = true;
+        root.statusMessage = "Session expired — reconnecting…";
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/logout");
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.autoLogoutInFlight = false;
+            root.isConnected = false;
+            root.activeChat = null;
+            root.activeChatMessages = [];
+            root.hasQrCode = false;
+            root.authFailStreak = 0;
+            root.pollStreak = 0;
+            root.lastMsgSig = "";
+            root.waitLoopRunning = false;
+            root.statusMessage = "WhatsApp session ended.\nScan the QR code to link again.";
+            checkStatus();
+        };
+        try {
+            xhr.send(JSON.stringify({ args: {} }));
+        } catch (e) {
+            root.autoLogoutInFlight = false;
+        }
     }
 
     function fetchChats() {
@@ -264,7 +346,10 @@ PlasmoidItem {
             if (xhr.status === 200) {
                 try {
                     var r = JSON.parse(xhr.responseText);
+                    var chats = r.response || r || [];
                     root.allChats = chats;
+                    root.chatsShown = 20;
+                    root.authFailStreak = 0;
                     var u = 0;
                     for (var i = 0; i < chats.length; i++) u += chats[i].unreadCount || 0;
                     root.totalUnread = u;
@@ -273,9 +358,19 @@ PlasmoidItem {
                 } catch(e) {
                     console.log("Parse error:", e);
                 }
+            } else if (xhr.status === 401) {
+                // WhatsApp session lost auth — reset to the QR login flow.
+                triggerAutoLogout();
             } else if (xhr.status === 503) {
-                root.isConnected = false;
-                root.statusMessage = "WhatsApp client initializing…";
+                // A single 503 is normal during a backend restart; repeated
+                // failures while we believe we're connected mean lost auth.
+                root.authFailStreak++;
+                if (root.authFailStreak >= 3) {
+                    triggerAutoLogout();
+                } else {
+                    root.isConnected = false;
+                    root.statusMessage = "WhatsApp client initializing…";
+                }
             }
         };
         xhr.send(JSON.stringify({ args: {} }));
@@ -348,6 +443,9 @@ PlasmoidItem {
             if (xhr.status === 200 && changed && root.activeChat && root.activeChat.id === chatId) {
                 fetchMessages(chatId, true);
                 messageWaitLoop(); // keep the chain going
+            } else if (xhr.status === 401) {
+                // Session lost auth mid-conversation — reset to QR flow.
+                triggerAutoLogout();
             } else if (xhr.status !== 200) {
                 // Error path: exponential backoff via messageWaitBackoff timer.
                 root.pollStreak++;
@@ -378,6 +476,10 @@ PlasmoidItem {
         if (useSince) {
             var lastKnown = existing[existing.length - 1];
             args.since = { id: lastKnown.id, t: lastKnown.t || 0 };
+        } else if (!background) {
+            // Cold open: only the most recent page; older history loads on
+            // scroll-up via beforeId (fetchOlderMessages).
+            args.limit = 20;
         }
 
         var xhr = new XMLHttpRequest();
@@ -387,6 +489,9 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             root.messagesInFlight = false;
+            // Discard responses for a chat that is no longer open — they must
+            // never merge into another chat's view.
+            if (root.activeChat === null || root.activeChat.id !== chatId) return;
             if (xhr.status === 200) {
                 try {
                     var r = JSON.parse(xhr.responseText);
@@ -398,12 +503,23 @@ PlasmoidItem {
                     root.lastMsgSig = sig;
                     root.pollStreak = 0;
                     var wasAtEnd = (typeof messageListView !== "undefined" && messageListView && messageListView.atYEnd);
+                    // Always merge against the LIVE list (not the snapshot
+                    // taken at request time): an optimistic send may have
+                    // appended a temp bubble while this request was in flight.
+                    // settleMessages() preserves unconfirmed temp sends and
+                    // drops temps the server has confirmed — no duplicates or
+                    // vanishing bubbles when sends and incoming polls race.
                     if (useSince) {
                         root.pollsSinceFull++;
-                        root.activeChatMessages = PollUtils.mergeMessages(existing, fresh);
+                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
                     } else {
                         root.pollsSinceFull = 0;
-                        root.activeChatMessages = fresh;
+                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        if (!background) root.msgsHasMore = (r.hasMore === true);
+                    }
+                    // Keep this chat's MRU cache copy fresh (thumbnailized).
+                    if (root.activeChat && root.activeChat.id === chatId) {
+                        root.mruStore(chatId, root.activeChatMessages, sig);
                     }
                     // Scroll to bottom after updating, but only when the user
                     // was already reading the latest messages.
@@ -417,9 +533,122 @@ PlasmoidItem {
                 } catch(e) {
                     console.log("Parse messages error:", e);
                 }
+            } else if (xhr.status === 401) {
+                // Session lost auth — reset to the QR login flow.
+                triggerAutoLogout();
+            } else if (xhr.status > 0) {
+                // Repeated server errors while connected point at lost auth.
+                root.authFailStreak++;
+                if (root.authFailStreak >= 3) triggerAutoLogout();
             }
         };
         xhr.send(JSON.stringify({ args: args }));
+    }
+
+    // ── Top-edge pagination: load 20 older messages on scroll-up ─────────────
+    function fetchOlderMessages() {
+        if (!root.isConnected || root.activeChat === null || root.msgsLoadingOlder || !root.msgsHasMore) return;
+        if (root.messagesInFlight) return; // serialize with background polls
+        var msgs = root.activeChatMessages;
+        if (msgs.length === 0) return;
+        var oldest = null;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && msgs[i].id && String(msgs[i].id).indexOf("temp_") !== 0) { oldest = msgs[i]; break; }
+        }
+        if (!oldest) return;
+
+        var chatId = root.activeChat.id;
+        root.msgsLoadingOlder = true;
+        root.msgsTopError = "";
+        root.messagesInFlight = true;
+
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getChatMessages");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.timeout = 30000;
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.msgsLoadingOlder = false;
+            root.messagesInFlight = false;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    if (root.activeChat === null || root.activeChat.id !== chatId) return;
+                    var older = r.response || [];
+                    root.msgsHasMore = (r.hasMore === true);
+                    if (older.length === 0) return;
+                    var oldH = (typeof messageListView !== "undefined" && messageListView) ? messageListView.contentHeight : 0;
+                    root.activeChatMessages = PollUtils.prependOlder(root.activeChatMessages, older);
+                    // Keep the visual anchor: shift by the height we added at
+                    // the top so the view doesn't jump.
+                    if (oldH > 0) {
+                        Qt.callLater(function() {
+                            if (typeof messageListView !== "undefined" && messageListView) {
+                                messageListView.contentY += messageListView.contentHeight - oldH;
+                            }
+                        });
+                    }
+                } catch(e) {
+                    root.msgsTopError = "Couldn't load older messages";
+                }
+            } else if (xhr.status === 401) {
+                triggerAutoLogout();
+            } else if (xhr.status > 0) {
+                // Failure keeps everything already loaded; the retry row shows.
+                root.msgsTopError = "Couldn't load older messages";
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId, limit: 20, beforeId: oldest.id, beforeT: oldest.t || 0 } }));
+    }
+
+    // ── MRU-3 chat cache: instant render + background revalidate ─────────────
+    function mruTouch(chatId) {
+        var ord = [];
+        for (var i = 0; i < root.mruOrder.length; i++) {
+            if (root.mruOrder[i] !== chatId) ord.push(root.mruOrder[i]);
+        }
+        ord.unshift(chatId);
+        while (ord.length > 3) {
+            var evict = ord.pop();
+            var next = {};
+            for (var k in root.msgCache) {
+                if (k !== evict) next[k] = root.msgCache[k];
+            }
+            root.msgCache = next;
+        }
+        root.mruOrder = ord;
+    }
+
+    function mruStore(chatId, messages, sig) {
+        if (!chatId || !messages || messages.length === 0) return;
+        var thumbs = [];
+        for (var i = 0; i < messages.length; i++) {
+            thumbs.push(MsgUtils.thumbnailize(messages[i], 4096));
+        }
+        var next = {};
+        for (var k in root.msgCache) next[k] = root.msgCache[k];
+        next[chatId] = { messages: thumbs, sig: sig || "", savedAt: Date.now() };
+        root.msgCache = next;
+        root.mruTouch(chatId);
+    }
+
+    // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
+    function openMediaViewer(startIndex) {
+        var list = MsgUtils.buildMediaList(root.activeChatMessages);
+        if (!list || list.length === 0 || startIndex < 0 || startIndex >= list.length) return;
+        root.mediaList = list;
+        root.mediaIndex = startIndex;
+        root.viewerVisible = true;
+    }
+
+    function closeMediaViewer() {
+        root.viewerVisible = false;
+    }
+
+    function viewerStep(d) {
+        if (!root.mediaList || root.mediaList.length === 0) return;
+        root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
     }
 
     function sendMessage(chatId, text) {
@@ -647,6 +876,13 @@ PlasmoidItem {
         onTriggered: checkStatus()
     }
     Timer {
+        id: qrRefreshTimer
+        interval: 3000
+        running: !root.isConnected && root.hasQrCode
+        repeat: true
+        onTriggered: root.qrSeq++
+    }
+    Timer {
         id: pollTimer
         interval: 20000
         running:  root.isConnected && root.activeChat === null
@@ -839,6 +1075,29 @@ PlasmoidItem {
                         Layout.alignment: Qt.AlignHCenter
                     }
 
+                    Rectangle {
+                        visible: root.hasQrCode
+                        width: 200; height: 200; radius: 12
+                        color: "white"
+                        Layout.alignment: Qt.AlignHCenter
+                        Image {
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            fillMode: Image.PreserveAspectFit
+                            cache: false
+                            visible: root.hasQrCode
+                            source: apiHost + "/api/qr?key=" + apiKey + "&t=" + root.qrSeq
+                        }
+                    }
+
+                    PlasmaComponents.Label {
+                        visible: !root.hasQrCode && !root.isConnected
+                        text: "Waiting for QR code…"
+                        font.pointSize: 9
+                        color: root.colSub
+                        Layout.alignment: Qt.AlignHCenter
+                    }
+
                     PlasmaComponents.Label {
                         text: root.statusMessage
                         horizontalAlignment: Text.AlignHCenter
@@ -1003,9 +1262,17 @@ PlasmoidItem {
                     ListView {
                         id: chatListView
                         width: parent.width
-                        model: root.filteredChats
+                        model: root.filteredChats.slice(0, root.chatsShown)
                         spacing: 0
                         reuseItems: true
+
+                        // Infinite scroll: grow the window when the user hits
+                        // the bottom of the rendered chats.
+                        onAtYEndChanged: {
+                            if (atYEnd && root.filteredChats.length > root.chatsShown) {
+                                root.chatsShown += 20;
+                            }
+                        }
 
                         // Empty state
                         PlasmaComponents.Label {
@@ -1138,6 +1405,8 @@ PlasmoidItem {
                                             font.pointSize: 8.5
                                             color: root.colSub
                                             elide: Text.ElideRight
+                                            maximumLineCount: 1
+                                            wrapMode: Text.NoWrap
                                             Layout.fillWidth: true
                                         }
 
@@ -1247,6 +1516,15 @@ PlasmoidItem {
                                 elide: Text.ElideRight
                                 Layout.fillWidth: true
                             }
+                            // "Updating…" cue while a revalidate/poll is in
+                            // flight over an already-rendered list (MRU cache
+                            // hits must visibly refresh, never sit stale).
+                            PlasmaComponents.Label {
+                                visible: root.messagesInFlight && root.activeChatMessages.length > 0
+                                text: "Updating…"
+                                font.pointSize: 7.5
+                                color: root.colSub
+                            }
                             // Subtitle (JID/phone number) intentionally hidden —
                             // the raw WhatsApp ID under the name was visual noise.
                         }
@@ -1281,6 +1559,53 @@ PlasmoidItem {
                             if (count > 0 && messageListView.atYEnd) Qt.callLater(messageListView.positionViewAtEnd);
                         }
                         onWidthChanged: if (count > 0) Qt.callLater(messageListView.positionViewAtEnd);
+
+                        // Top-edge lazy loading: fetch 20 older messages when
+                        // the user scrolls to the very top.
+                        onAtYBeginningChanged: {
+                            if (atYBeginning && root.msgsHasMore && !root.msgsLoadingOlder &&
+                                root.msgsTopError === "" && contentY < 200 &&
+                                root.activeChatMessages.length > 0) {
+                                root.fetchOlderMessages();
+                            }
+                        }
+
+                        header: Item {
+                            width: messageListView.width
+                            height: (root.msgsLoadingOlder || root.msgsTopError !== "") ? 36 : 0
+                            visible: height > 0
+
+                            PlasmaComponents.Label {
+                                anchors.centerIn: parent
+                                visible: root.msgsLoadingOlder
+                                text: "Loading older messages…"
+                                color: root.colSub
+                                font.pointSize: 8
+                            }
+
+                            RowLayout {
+                                anchors.centerIn: parent
+                                spacing: 8
+                                visible: root.msgsTopError !== ""
+
+                                PlasmaComponents.Label {
+                                    text: root.msgsTopError
+                                    color: root.colSub
+                                    font.pointSize: 8
+                                }
+
+                                PlasmaComponents.Label {
+                                    text: "↻ Retry"
+                                    color: root.colAccent
+                                    font.pointSize: 8.5
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.fetchOlderMessages()
+                                    }
+                                }
+                            }
+                        }
 
                         // Placeholder if loading messages
                         PlasmaComponents.Label {
@@ -1431,21 +1756,40 @@ PlasmoidItem {
 
                                             Image {
                                                 id: msgImage
-                                                visible: modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo")))
+                                                visible: !modelData._thumb && (modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
                                                 source: {
                                                     if (!visible || !modelData.body) return "";
-                                                    if (modelData.body.startsWith("data:")) return modelData.body;
-                                                    var prefix = "data:image/jpeg;base64,";
-                                                    if (modelData.body.startsWith("iVBORw0KGgo")) {
-                                                        prefix = "data:image/png;base64,";
-                                                    }
-                                                    return prefix + modelData.body;
+                                                    return MsgUtils.mediaSource(modelData);
                                                 }
                                                 fillMode: Image.PreserveAspectFit
                                                 Layout.maximumWidth: messageListView.width * 0.7
                                                 Layout.preferredWidth: Math.min(messageListView.width * 0.7, 240)
                                                 Layout.preferredHeight: Math.min(messageListView.width * 0.7, 180)
                                                 asynchronous: true
+
+                                                // Tap to open the fullscreen viewer.
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    onClicked: {
+                                                        var list = MsgUtils.buildMediaList(root.activeChatMessages);
+                                                        var idx = -1;
+                                                        for (var i = 0; i < list.length; i++) {
+                                                            if (list[i].id === modelData.id) { idx = i; break; }
+                                                        }
+                                                        root.openMediaViewer(idx);
+                                                    }
+                                                }
+                                            }
+
+                                            // MRU cached-copy placeholder for large
+                                            // media (thumbnailized); the full body
+                                            // returns after revalidation.
+                                            PlasmaComponents.Label {
+                                                visible: !!modelData._thumb
+                                                text: MsgUtils.mediaLabel(modelData.type) || "📷 Media"
+                                                font.pointSize: 9
+                                                color: root.colSub
+                                                Layout.maximumWidth: messageListView.width * 0.7
                                             }
 
                                             PlasmaComponents.Label {
@@ -2040,6 +2384,173 @@ PlasmoidItem {
             }
         }
     }
+    // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
+    // Pinch-zoom/pan for images and stickers with prev/next navigation.
+    // NOTE: QtMultimedia is not available in this plasmoid sandbox (Slice 0
+    // spike), so video messages render their base64 preview enlarged with an
+    // "open on phone" note instead of inline playback.
+    Rectangle {
+        id: mediaViewer
+        anchors.fill: parent
+        z: 100
+        visible: root.viewerVisible
+        color: "#000000"
+        focus: visible
+        Keys.onEscapePressed: root.closeMediaViewer()
+        Keys.onLeftPressed: root.viewerStep(-1)
+        Keys.onRightPressed: root.viewerStep(1)
+
+        function currentMsg() {
+            if (!root.mediaList || root.mediaList.length === 0) return null;
+            var i = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            return root.mediaList[i];
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 0
+
+            // Header: counter + close
+            Rectangle {
+                Layout.fillWidth: true
+                height: 44
+                color: "#cc000000"
+
+                RowLayout {
+                    anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
+                    spacing: 8
+
+                    PlasmaComponents.Label {
+                        text: root.mediaList.length > 0
+                              ? (Math.min(root.mediaIndex, root.mediaList.length - 1) + 1) + " of " + root.mediaList.length
+                              : ""
+                        color: "#ffffff"
+                        font.pointSize: 9
+                        Layout.fillWidth: true
+                    }
+
+                    PlasmaComponents.ToolButton {
+                        icon.name: "dialog-close"
+                        display: PlasmaComponents.ToolButton.IconOnly
+                        onClicked: root.closeMediaViewer()
+                    }
+                }
+            }
+
+            // Stage: pinch-zoom + drag-pan; click closes, double-click resets,
+            // drag down dismisses.
+            Item {
+                id: viewerStage
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                property real vScale: 1.0
+                property real vTx: 0
+                property real vTy: 0
+                function reset() { vScale = 1.0; vTx = 0; vTy = 0; }
+
+                Image {
+                    id: viewerImage
+                    anchors.centerIn: parent
+                    source: {
+                        var m = mediaViewer.currentMsg();
+                        return m ? MsgUtils.mediaSource(m) : "";
+                    }
+                    fillMode: Image.PreserveAspectFit
+                    scale: viewerStage.vScale
+                    transform: Translate { x: viewerStage.vTx; y: viewerStage.vTy }
+                    asynchronous: true
+
+                    PlasmaComponents.Label {
+                        anchors.centerIn: parent
+                        visible: {
+                            var m = mediaViewer.currentMsg();
+                            return !!m && m.type === "video";
+                        }
+                        text: "🎥 Video — open on phone to play"
+                        color: "#ffffff"
+                        font.pointSize: 9
+                        style: Text.Outline
+                        styleColor: "#80000000"
+                    }
+                }
+
+                PinchArea {
+                    anchors.fill: parent
+                    onPinchUpdated: {
+                        viewerStage.vScale = Math.min(4, Math.max(0.5, viewerStage.vScale * pinch.scale));
+                    }
+                    MouseArea {
+                        id: viewerPan
+                        anchors.fill: parent
+                        property real lastX: 0
+                        property real lastY: 0
+                        property real startY: 0
+                        property bool moved: false
+                        onPressed: function(mouse) {
+                            lastX = mouse.x; lastY = mouse.y; startY = mouse.y; moved = false;
+                        }
+                        onPositionChanged: function(mouse) {
+                            var dx = mouse.x - lastX;
+                            var dy = mouse.y - lastY;
+                            if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+                            if (viewerStage.vScale > 1.05) {
+                                viewerStage.vTx += dx;
+                                viewerStage.vTy += dy;
+                            } else if (dy > 0 && mouse.y - startY > 80) {
+                                root.closeMediaViewer();   // swipe-down dismiss
+                            }
+                            lastX = mouse.x; lastY = mouse.y;
+                        }
+                        onClicked: if (!moved) root.closeMediaViewer()
+                        onDoubleClicked: viewerStage.reset()
+                    }
+                }
+            }
+
+                // Footer: prev / next + media label
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 52
+                    color: "#cc000000"
+
+                    RowLayout {
+                        anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
+                        spacing: 12
+
+                        PlasmaComponents.ToolButton {
+                            icon.name: "go-previous"
+                            display: PlasmaComponents.ToolButton.IconOnly
+                            visible: root.mediaList.length > 1
+                            onClicked: root.viewerStep(-1)
+                        }
+                        Item { Layout.fillWidth: true }
+                        PlasmaComponents.Label {
+                            text: {
+                                var m = mediaViewer.currentMsg();
+                                return m ? (MsgUtils.mediaLabel(m.type) || "📷 Media") : "";
+                            }
+                            color: "#ffffff"
+                            font.pointSize: 9
+                        }
+                        Item { Layout.fillWidth: true }
+                        PlasmaComponents.ToolButton {
+                            icon.name: "go-next"
+                            display: PlasmaComponents.ToolButton.IconOnly
+                            visible: root.mediaList.length > 1
+                            onClicked: root.viewerStep(1)
+                        }
+                    }
+                }
+        }
+
+        onVisibleChanged: {
+            if (visible) {
+                viewerStage.reset();
+                mediaViewer.forceActiveFocus();
+            }
+        }
+    }
+
 // Pure-QML clipboard helper (TextEdit.selectAll + copy)
     TextEdit {
         id: clipTextEdit
