@@ -24,6 +24,7 @@ const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { exec } = require('child_process');
 
@@ -910,58 +911,137 @@ app.get('/api/avatar/:hash', (req, res) => {
 // 503 backend not ready. In-page fn is toString-injected (this
 // puppeteer-core build does not forward page.evaluate args), so it must
 // stay fully self-contained — see lib/media.js getMediaInPage.
-app.post('/api/getMedia', async (req, res) => {
-    const parsed = mediaLib.parseMediaArgs(req.body);
-    if (parsed.error) return res.status(400).json({ error: parsed.error });
-    const chatId = parsed.chatId;
-    const msgId = parsed.msgId;
-    const maxEdge = parsed.maxEdge;
+// ── Shared media fetch (used by /api/getMedia + /api/openExternally) ───────
+// Returns { dataUrl, width, height } (full-res when maxEdge=0), using the
+// server-side LRU to avoid re-downloads. Throws an Error with .status set
+// (503 not ready, 404 msg not loaded, 502 download failed) so routes can
+// map it directly to HTTP. Cache behaviour matches the original getMedia.
+async function getMediaDataUrl(chatId, msgId, maxEdge) {
+    const page = await getValidPage();
+    if (!isReady || !page) {
+        const e = new Error('Not ready');
+        e.status = 503;
+        throw e;
+    }
 
+    const key = mediaLib.cacheKey(chatId, msgId, maxEdge);
+    const hit = mediaLib.mediaCache.get(key);
+    if (hit && hit.dataUrl) {
+        return { dataUrl: hit.dataUrl, width: hit.width, height: hit.height };
+    }
+
+    // Inject args as a JSON literal — page.evaluate args arrive
+    // undefined in this build, so the in-page fn takes none.
+    const payload = JSON.stringify({ chatId: chatId, msgId: msgId, maxEdge: maxEdge });
+    const src = '(' + mediaLib.getMediaInPage.toString() + ')(' + payload + ');';
+    let result;
     try {
-        const page = await getValidPage();
-        if (!isReady || !page) return res.status(503).json({ error: 'Not ready' });
-
-        const key = mediaLib.cacheKey(chatId, msgId, maxEdge);
-        const hit = mediaLib.mediaCache.get(key);
-        if (hit && hit.dataUrl) {
-            return res.json({ response: { dataUrl: hit.dataUrl, width: hit.width, height: hit.height } });
-        }
-
-        // Inject args as a JSON literal — page.evaluate args arrive
-        // undefined in this build, so the in-page fn takes none.
-        const payload = JSON.stringify({ chatId: chatId, msgId: msgId, maxEdge: maxEdge });
-        const src = '(' + mediaLib.getMediaInPage.toString() + ')(' + payload + ');';
-        const result = await Promise.race([
+        result = await Promise.race([
             page.evaluate(new Function('return ' + src)),
             new Promise(function (_, reject) {
                 setTimeout(function () { reject(new Error('getMedia timed out')); }, 30000);
             }),
         ]);
+    } catch (e) {
+        const err = new Error('Media download failed');
+        err.status = 502;
+        err.detail = String((e && e.message) || e);
+        throw err;
+    }
 
-        if (!result || result.error) {
-            const detail = result && result.error ? String(result.error) : '';
-            if (detail.indexOf('NOT_FOUND') === 0) {
-                return res.status(404).json({ error: 'Message not loaded: ' + detail });
-            }
-            if (detail.indexOf('DOWNLOAD_FAILED') === 0 || /timed out/.test(detail)) {
-                return res.status(502).json({ error: 'Media download failed: ' + detail });
-            }
-            return res.status(502).json({ error: 'Media download failed: ' + detail });
-        }
-        if (!result.dataUrl) return res.status(502).json({ error: 'Media download failed: ' + detail });
+    if (!result || result.error) {
+        const detail = result && result.error ? String(result.error) : 'empty result';
+        const err = new Error(detail.indexOf('NOT_FOUND') === 0
+            ? 'Message not loaded: ' + detail
+            : 'Media download failed: ' + detail);
+        err.status = detail.indexOf('NOT_FOUND') === 0 ? 404 : 502;
+        err.detail = detail;
+        throw err;
+    }
+    if (!result.dataUrl) {
+        const err = new Error('Media download failed: empty result');
+        err.status = 502;
+        err.detail = 'empty result';
+        throw err;
+    }
 
-        mediaLib.mediaCache.put(key, {
-            dataUrl: result.dataUrl,
-            width: result.width,
-            height: result.height,
-        });
-        res.json({ response: { dataUrl: result.dataUrl, width: result.width, height: result.height } });
+    mediaLib.mediaCache.put(key, {
+        dataUrl: result.dataUrl,
+        width: result.width,
+        height: result.height,
+    });
+    return { dataUrl: result.dataUrl, width: result.width, height: result.height };
+}
+
+function mediaHttpStatus(e) {
+    const s = e && e.status;
+    if (s === 503 || s === 404 || s === 502 || s === 400) return s;
+    if (e && /timed out/.test(String(e.message || ''))) return 502;
+    return 500;
+}
+
+app.post('/api/getMedia', async (req, res) => {
+    const parsed = mediaLib.parseMediaArgs(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    try {
+        const out = await getMediaDataUrl(parsed.chatId, parsed.msgId, parsed.maxEdge);
+        res.json({ response: { dataUrl: out.dataUrl, width: out.width, height: out.height } });
     } catch (e) {
         const msg = String((e && e.message) || e);
-        if (/timed out/.test(msg)) return res.status(502).json({ error: 'Media download failed' });
+        const status = mediaHttpStatus(e);
+        if (status !== 500) return res.status(status).json({ error: msg });
         console.error('getMedia error:', msg);
         res.status(500).json({ error: msg });
     }
+});
+
+// ── openExternally: full-res image → temp file → system viewer via xdg-open ─
+// POST /api/openExternally { chatId, msgId } → { response: { path } }.
+// Full-res (maxEdge 0) via the shared helper (LRU hit avoids re-download).
+// Errors: 400 missing params; 404/502/503 passthrough from media fetch;
+// 500 with detail when temp-file write or xdg-open spawn fails.
+app.post('/api/openExternally', async (req, res) => {
+    const parsed = mediaLib.parseOpenArgs(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    let data;
+    try {
+        data = await getMediaDataUrl(parsed.chatId, parsed.msgId, 0);
+    } catch (e) {
+        const msg = String((e && e.message) || e);
+        const status = mediaHttpStatus(e);
+        if (status !== 500) return res.status(status).json({ error: msg });
+        console.error('openExternally error:', msg);
+        return res.status(500).json({ error: msg });
+    }
+
+    const m = /^data:image\/jpeg;base64,(.+)$/.exec(String(data.dataUrl || ''));
+    if (!m) {
+        return res.status(500).json({ error: 'Unexpected media encoding', detail: 'expected jpeg dataUrl' });
+    }
+    let buf;
+    try {
+        buf = Buffer.from(m[1], 'base64');
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not decode media', detail: String((e && e.message) || e) });
+    }
+    const safe = mediaLib.sanitizeMsgId(parsed.msgId);
+    const file = path.join(os.tmpdir(), 'whatsapp-kde-media-' + safe + '.jpg');
+    try {
+        fs.writeFileSync(file, buf);
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not write temp file', detail: String((e && e.message) || e) });
+    }
+    try {
+        const { spawn } = require('child_process');
+        const child = spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
+        child.on('error', (err) => console.error('openExternally spawn error:', err.message));
+        child.unref();
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not open system viewer', detail: String((e && e.message) || e) });
+    }
+    res.json({ response: { path: file } });
 });
 
 // ── QR code bytes (GET, key via query so QML Image can pass ?key=) ──────────

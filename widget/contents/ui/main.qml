@@ -69,6 +69,7 @@ PlasmoidItem {
     property bool   viewerFullLoading: false // full-res fetch in flight for viewer
     property string viewerFullSource: ""    // dataUrl of the full-res viewer image
     property string viewerFullMsgId: ""     // msg id the viewerFullSource belongs to
+    property string viewerOpenError: ""     // transient openExternally failure text
     property string _pendingOpenChatId: ""  // cold open queued while a poll is in flight
     property int    _waitGen: 0             // wait-loop generation (chat switches)
 
@@ -789,16 +790,19 @@ PlasmoidItem {
         root.mediaList = list;
         root.mediaIndex = startIndex;
         root.viewerVisible = true;
+        root.viewerOpenError = "";
         root.viewerLoadFull();
     }
 
     function closeMediaViewer() {
         root.viewerVisible = false;
         root.viewerFullLoading = false;
+        root.viewerOpenError = "";
     }
 
     function viewerStep(d) {
         if (!root.mediaList || root.mediaList.length === 0) return;
+        root.viewerOpenError = "";
         root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
     }
 
@@ -879,6 +883,36 @@ PlasmoidItem {
                 });
             })(sides[s]);
         }
+    }
+
+    // Open the current viewer image in the system viewer via
+    // POST /api/openExternally (full-res fetch + xdg-open server-side).
+    // Failures show a brief inline footer error, never silent or fatal.
+    function openExternallyCurrent() {
+        var m = null;
+        if (root.mediaList && root.mediaList.length > 0) {
+            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            m = root.mediaList[ci];
+        }
+        if (!m || !m.id || !root.isConnected || !root.activeChat) {
+            root.viewerOpenError = "Couldn't open image";
+            viewerOpenErrorTimer.restart();
+            return;
+        }
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/openExternally");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                root.viewerOpenError = "";
+            } else {
+                root.viewerOpenError = "Couldn't open in system viewer";
+                viewerOpenErrorTimer.restart();
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: root.activeChat.id, msgId: m.id } }));
     }
 
     function sendMessage(chatId, text) {
@@ -2791,6 +2825,19 @@ PlasmoidItem {
                             color: "#ffffff"
                             font.pointSize: 9
                         }
+                        PlasmaComponents.ToolButton {
+                            icon.name: "window-new"
+                            display: PlasmaComponents.ToolButton.IconOnly
+                            ToolTip.text: "Open in system viewer"
+                            ToolTip.visible: hovered
+                            onClicked: root.openExternallyCurrent()
+                        }
+                        PlasmaComponents.Label {
+                            visible: root.viewerOpenError !== ""
+                            text: root.viewerOpenError
+                            color: "#ff8a80"
+                            font.pointSize: 8
+                        }
                         Item { Layout.fillWidth: true }
                         PlasmaComponents.ToolButton {
                             icon.name: "go-next"
@@ -2807,6 +2854,12 @@ PlasmoidItem {
                 viewerStage.reset();
                 mediaViewer.forceActiveFocus();
             }
+        }
+
+        Timer {
+            id: viewerOpenErrorTimer
+            interval: 3000
+            onTriggered: root.viewerOpenError = ""
         }
     }
 

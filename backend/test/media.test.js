@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 
 const {
     parseMediaArgs,
+    parseOpenArgs,
+    sanitizeMsgId,
     cacheKey,
     createMediaCache,
     getMediaInPage,
@@ -34,6 +36,40 @@ test('parseMediaArgs defaults maxEdge to 480 and keeps explicit 0', () => {
     assert.equal(parseMediaArgs({ chatId: 'c', msgId: 'm', maxEdge: 'abc' }).maxEdge, DEFAULT_MAX_EDGE);
     assert.equal(parseMediaArgs({ chatId: 'c', msgId: 'm', maxEdge: -5 }).maxEdge, DEFAULT_MAX_EDGE);
     assert.equal(parseMediaArgs({ chatId: 'c', msgId: 'm', maxEdge: '480' }).maxEdge, 480);
+});
+
+// ── parseOpenArgs ─────────────────────────────────────────────────────────
+
+test('parseOpenArgs accepts args-wrapped and bare bodies', () => {
+    assert.deepEqual(parseOpenArgs({ args: { chatId: 'c1', msgId: 'm1' } }), { chatId: 'c1', msgId: 'm1' });
+    assert.deepEqual(parseOpenArgs({ chatId: 'c1', msgId: 'm1' }), { chatId: 'c1', msgId: 'm1' });
+});
+
+test('parseOpenArgs rejects missing chatId or msgId', () => {
+    assert.ok(parseOpenArgs({ args: { msgId: 'm1' } }).error);
+    assert.ok(parseOpenArgs({ args: { chatId: 'c1' } }).error);
+    assert.ok(parseOpenArgs({}).error);
+    assert.ok(parseOpenArgs(null).error);
+});
+
+// ── sanitizeMsgId ─────────────────────────────────────────────────────────
+
+test('sanitizeMsgId keeps safe chars only', () => {
+    assert.equal(sanitizeMsgId('ABC_abc-123'), 'ABC_abc-123');
+    assert.equal(sanitizeMsgId('true_123@c.us_456'), 'true_123_c.us_456'.replace('.', '_'));
+    assert.equal(sanitizeMsgId('a/b\\c:d e'), 'a_b_c_d_e');
+    assert.equal(sanitizeMsgId('../../etc/passwd'), 'etc_passwd');
+});
+
+test('sanitizeMsgId falls back when nothing safe remains', () => {
+    assert.equal(sanitizeMsgId(''), 'media');
+    assert.equal(sanitizeMsgId('...'), 'media');
+    assert.equal(sanitizeMsgId(null), 'media');
+});
+
+test('sanitizeMsgId caps length for file names', () => {
+    const long = sanitizeMsgId('x'.repeat(200));
+    assert.ok(long.length <= 64);
 });
 
 // ── cacheKey ────────────────────────────────────────────────────────────────

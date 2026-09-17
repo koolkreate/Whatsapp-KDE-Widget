@@ -36,6 +36,27 @@ function cacheKey(chatId, msgId, maxEdge) {
     return String(chatId) + '|' + String(msgId) + '|' + String(maxEdge);
 }
 
+// Sanitize a message id for safe use in a temp file name: keep only
+// [A-Za-z0-9_-], replacing anything else with '_'. Falls back to 'media'
+// when nothing safe remains. Pure (no fs access).
+function sanitizeMsgId(msgId) {
+    const s = String(msgId == null ? '' : msgId).replace(/[^A-Za-z0-9_-]/g, '_');
+    const trimmed = s.slice(0, 64).replace(/^_+|_+$/g, '');
+    return trimmed || 'media';
+}
+
+// Normalize a POST /api/openExternally body into { chatId, msgId }.
+// Accepts { args: {...} } or a bare args object. Returns { error } on
+// missing params. Unlike parseMediaArgs there is no maxEdge: callers
+// always fetch full resolution (maxEdge 0).
+function parseOpenArgs(body) {
+    const args = (body && body.args) || body || {};
+    const chatId = args.chatId;
+    const msgId = args.msgId;
+    if (!chatId || !msgId) return { error: 'Missing chatId or msgId' };
+    return { chatId: String(chatId), msgId: String(msgId) };
+}
+
 // Byte-capped LRU over a Map (insertion order = oldest first).
 // Entry shape: { dataUrl, width, height, bytes? } — bytes defaults to the
 // utf8 length of the dataUrl string.
@@ -236,6 +257,8 @@ module.exports = {
     JPEG_QUALITY: JPEG_QUALITY,
     DEFAULT_MAX_EDGE: DEFAULT_MAX_EDGE,
     parseMediaArgs: parseMediaArgs,
+    parseOpenArgs: parseOpenArgs,
+    sanitizeMsgId: sanitizeMsgId,
     cacheKey: cacheKey,
     createMediaCache: createMediaCache,
     mediaCache: mediaCache,
