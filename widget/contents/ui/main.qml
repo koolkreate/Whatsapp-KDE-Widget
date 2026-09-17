@@ -65,6 +65,8 @@ PlasmoidItem {
     property bool   viewerVisible: false    // fullscreen media overlay
     property var    mediaList: []           // viewable media msgs of the open chat
     property int    mediaIndex: 0
+    property string _pendingOpenChatId: ""  // cold open queued while a poll is in flight
+    property int    _waitGen: 0             // wait-loop generation (chat switches)
 
     function isChatPinned(chat) {
         if (!chat) return false;
@@ -137,6 +139,9 @@ PlasmoidItem {
         root.pollsSinceFull = 0;
         root.msgsTopError = "";
         if (activeChat !== null) {
+            root._waitGen++;
+            root.waitLoopRunning = false;
+            root._pendingOpenChatId = "";
             root.mruTouch(activeChat.id);
             var cached = root.msgCache[activeChat.id];
             if (cached && cached.messages && cached.messages.length > 0) {
@@ -424,6 +429,7 @@ PlasmoidItem {
         if (!root.isConnected || root.activeChat === null || root.waitLoopRunning) return;
         root.waitLoopRunning = true;
         var chatId = root.activeChat.id;
+        var gen = root._waitGen;
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/waitMessages");
         xhr.setRequestHeader("Content-Type",  "application/json");
@@ -431,6 +437,7 @@ PlasmoidItem {
         xhr.timeout = 25000;
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (PollUtils.isStaleLoop(gen, root._waitGen)) return;
             root.waitLoopRunning = false;
             var changed = false;
             if (xhr.status === 200) {
@@ -464,7 +471,14 @@ PlasmoidItem {
     }
 
     function fetchMessages(chatId, background) {
-        if (!root.isConnected || !chatId || root.messagesInFlight) return;
+        if (!root.isConnected || !chatId) return;
+        if (root.messagesInFlight) {
+            if (PollUtils.shouldQueueColdOpen(true, background)) {
+                root._pendingOpenChatId = chatId;
+                root.isLoadingMessages = true;
+            }
+            return;
+        }
         root.messagesInFlight = true;
         if (!background) root.isLoadingMessages = true;
 
@@ -489,6 +503,12 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             root.messagesInFlight = false;
+            var pending = PollUtils.consumePendingOpen(root._pendingOpenChatId, root.activeChat ? root.activeChat.id : "");
+            root._pendingOpenChatId = "";
+            if (pending) {
+                fetchMessages(pending, false);
+                return;
+            }
             // Discard responses for a chat that is no longer open — they must
             // never merge into another chat's view.
             if (root.activeChat === null || root.activeChat.id !== chatId) return;
