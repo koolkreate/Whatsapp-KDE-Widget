@@ -128,10 +128,11 @@ function mediaSource(msg) {
     return '';
 }
 
-// All viewable media messages (image/video/sticker/base64 stills) in chat
-// order — used for the fullscreen viewer's list and prev/next navigation.
-// Entries with neither body nor thumbUrl are skipped (nothing to render).
-// _thumb placeholders are included only when they carry a thumbUrl.
+// All image/video/sticker messages in chat order — used for the fullscreen
+// viewer's list and prev/next navigation. Typed media is included even with
+// an empty body and no thumbUrl: tapping it still opens the viewer, which
+// resolves the full bytes on demand via /api/getMedia. Plain text without a
+// media-looking body is excluded.
 function buildMediaList(msgs) {
     const out = [];
     const list = Array.isArray(msgs) ? msgs : [];
@@ -139,11 +140,6 @@ function buildMediaList(msgs) {
         const m = list[i];
         if (!m || typeof m !== 'object') continue;
         const b = typeof m.body === 'string' ? m.body : '';
-        const tu = typeof m.thumbUrl === 'string' ? m.thumbUrl : (m.thumbUrl ? String(m.thumbUrl) : '');
-        const hasBody = b.length > 0;
-        const hasThumb = tu.length > 0;
-        if (!hasBody && !hasThumb) continue;
-        if (m._thumb && !hasThumb) continue;
         const looksMedia = b.indexOf('/9j/') === 0 || b.indexOf('data:image') === 0 ||
                            b.indexOf('iVBORw0KGgo') === 0;
         if (m.type === 'image' || m.type === 'video' || m.type === 'sticker' || looksMedia) {

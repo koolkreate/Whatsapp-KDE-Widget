@@ -67,6 +67,7 @@ PlasmoidItem {
     property int    mediaIndex: 0
     property var    _thumbInflight: ({})    // msgId|maxEdge -> true (getMedia dedupe)
     property bool   viewerFullLoading: false // full-res fetch in flight for viewer
+    property bool   viewerFullFailed: false // full-res fetch failed (retry cue)
     property string viewerFullSource: ""    // dataUrl of the full-res viewer image
     property string viewerFullMsgId: ""     // msg id the viewerFullSource belongs to
     property string viewerOpenError: ""     // transient openExternally failure text
@@ -791,17 +792,20 @@ PlasmoidItem {
         root.mediaIndex = startIndex;
         root.viewerVisible = true;
         root.viewerOpenError = "";
+        root.viewerFullFailed = false;
         root.viewerLoadFull();
     }
 
     function closeMediaViewer() {
         root.viewerVisible = false;
         root.viewerFullLoading = false;
+        root.viewerFullFailed = false;
         root.viewerOpenError = "";
     }
 
     function viewerStep(d) {
         if (!root.mediaList || root.mediaList.length === 0) return;
+        root.viewerFullFailed = false;
         root.viewerOpenError = "";
         root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
     }
@@ -833,6 +837,7 @@ PlasmoidItem {
         root.viewerFullMsgId = mid;
         root.viewerFullSource = "";
         root.viewerFullLoading = true;
+        root.viewerFullFailed = false;
         var chatId = root.activeChat.id;
         root.fetchMedia(chatId, mid, 0, function(url) {
             var cur = null;
@@ -850,9 +855,11 @@ PlasmoidItem {
                     }
                 }
                 root.viewerFullLoading = false;
+                root.viewerFullFailed = false;
             } else {
                 root.viewerFullSource = "";
                 root.viewerFullLoading = false;
+                root.viewerFullFailed = true;
             }
             root.viewerPrefetchNeighbours();
         });
@@ -2741,11 +2748,12 @@ PlasmoidItem {
                     asynchronous: true
 
                     // Loading overlay while the full-res image arrives; the
-                    // cached 480p thumb stays painted underneath.
+                    // cached 480p thumb stays painted underneath. On failure
+                    // the overlay names the problem instead of going blank.
                     PlasmaComponents.Label {
                         anchors.centerIn: parent
-                        visible: root.viewerFullLoading
-                        text: "Loading full resolution…"
+                        visible: root.viewerFullLoading || root.viewerFullFailed
+                        text: root.viewerFullFailed ? "Couldn't load full image" : "Loading full resolution…"
                         color: "#ffffff"
                         font.pointSize: 9
                         style: Text.Outline

@@ -130,7 +130,7 @@ test('buildMediaList filters to viewable media in chat order', () => {
         { id: 'm6', _thumb: true, type: 'image', body: '' },
     ];
     const out = utils.buildMediaList(msgs);
-    assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm3', 'm4']);
+    assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm3', 'm4', 'm6']);
     assert.deepEqual(utils.buildMediaList([]), []);
     assert.deepEqual(utils.buildMediaList(null), []);
 });
@@ -169,7 +169,7 @@ test('thumbnailize preserves an existing thumbUrl onto the placeholder copy', ()
     assert.equal(out.thumbUrl, 'data:image/jpeg;base64,THUMB');
 });
 
-test('buildMediaList includes _thumb entries that carry a thumbUrl', () => {
+test('buildMediaList includes typed media even with empty body (viewer resolves full)', () => {
     const msgs = [
         { id: 'm1', type: 'chat', body: 'text' },
         { id: 'm2', type: 'image', body: '/9j/a' },
@@ -180,5 +180,5 @@ test('buildMediaList includes _thumb entries that carry a thumbUrl', () => {
         { id: 'm10', type: 'video', body: '', thumbUrl: 'data:image/jpeg;base64,THUMB' },
     ];
     const out = utils.buildMediaList(msgs);
-    assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm7', 'm9', 'm10']);
+    assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm6', 'm7', 'm8', 'm9', 'm10']);
 });
