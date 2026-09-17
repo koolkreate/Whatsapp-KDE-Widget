@@ -97,28 +97,53 @@ function thumbnailize(msg, maxLen) {
     return copy;
 }
 
+// Whether a bubble needs a 480p thumb fetch: image/video/sticker msgs that
+// lack both a usable full body and a thumbUrl. Text msgs and msgs already
+// carrying a thumbUrl or a non-empty body do not need a fetch.
+function needsThumb(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    var type = msg.type || '';
+    if (type !== 'image' && type !== 'video' && type !== 'sticker') return false;
+    var tu = typeof msg.thumbUrl === 'string' ? msg.thumbUrl : (msg.thumbUrl ? String(msg.thumbUrl) : '');
+    if (tu.length > 0) return false;
+    var b = typeof msg.body === 'string' ? msg.body : (msg.body ? String(msg.body) : '');
+    if (b.length > 0) return false;
+    return true;
+}
+
 // Build a data-URL for a media message body (extracted from the QML
-// msgImage.source logic). Returns '' when there is nothing renderable.
+// msgImage.source logic). Fallback order: full body data-URL when the body
+// is non-empty, else thumbUrl when present, else ''.
 function mediaSource(msg) {
     if (!msg) return '';
     var b = typeof msg.body === 'string' ? msg.body : '';
-    if (!b) return '';
-    if (b.indexOf('data:') === 0) return b;
-    var prefix = 'data:image/jpeg;base64,';
-    if (b.indexOf('iVBORw0KGgo') === 0) prefix = 'data:image/png;base64,';
-    return prefix + b;
+    if (b) {
+        if (b.indexOf('data:') === 0) return b;
+        var prefix = 'data:image/jpeg;base64,';
+        if (b.indexOf('iVBORw0KGgo') === 0) prefix = 'data:image/png;base64,';
+        return prefix + b;
+    }
+    var tu = typeof msg.thumbUrl === 'string' ? msg.thumbUrl : (msg.thumbUrl ? String(msg.thumbUrl) : '');
+    if (tu) return tu;
+    return '';
 }
 
 // All viewable media messages (image/video/sticker/base64 stills) in chat
 // order — used for the fullscreen viewer's list and prev/next navigation.
-// Thumbnail placeholders are skipped (no renderable body).
+// Entries with neither body nor thumbUrl are skipped (nothing to render).
+// _thumb placeholders are included only when they carry a thumbUrl.
 function buildMediaList(msgs) {
     const out = [];
     const list = Array.isArray(msgs) ? msgs : [];
     for (let i = 0; i < list.length; i++) {
         const m = list[i];
-        if (!m || m._thumb) continue;
+        if (!m || typeof m !== 'object') continue;
         const b = typeof m.body === 'string' ? m.body : '';
+        const tu = typeof m.thumbUrl === 'string' ? m.thumbUrl : (m.thumbUrl ? String(m.thumbUrl) : '');
+        const hasBody = b.length > 0;
+        const hasThumb = tu.length > 0;
+        if (!hasBody && !hasThumb) continue;
+        if (m._thumb && !hasThumb) continue;
         const looksMedia = b.indexOf('/9j/') === 0 || b.indexOf('data:image') === 0 ||
                            b.indexOf('iVBORw0KGgo') === 0;
         if (m.type === 'image' || m.type === 'video' || m.type === 'sticker' || looksMedia) {
@@ -169,6 +194,7 @@ if (typeof module !== 'undefined' && module.exports) {
         compareChats: compareChats,
         thumbnailize: thumbnailize,
         mediaSource: mediaSource,
-        buildMediaList: buildMediaList
+        buildMediaList: buildMediaList,
+        needsThumb: needsThumb
     };
 }

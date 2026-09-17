@@ -134,3 +134,51 @@ test('buildMediaList filters to viewable media in chat order', () => {
     assert.deepEqual(utils.buildMediaList([]), []);
     assert.deepEqual(utils.buildMediaList(null), []);
 });
+
+test('needsThumb flags image/video/sticker msgs lacking body and thumbUrl', () => {
+    assert.equal(utils.needsThumb({ type: 'image', body: '' }), true);
+    assert.equal(utils.needsThumb({ type: 'video', body: '' }), true);
+    assert.equal(utils.needsThumb({ type: 'sticker', body: '' }), true);
+    assert.equal(utils.needsThumb({ type: 'image' }), true);
+    assert.equal(utils.needsThumb({ _thumb: true, type: 'image', body: '' }), true);
+    assert.equal(utils.needsThumb(null), false);
+});
+
+test('needsThumb is false for text and msgs already carrying thumbUrl/full body', () => {
+    assert.equal(utils.needsThumb({ type: 'chat', body: '' }), false);
+    assert.equal(utils.needsThumb({ type: 'chat', body: 'hello' }), false);
+    assert.equal(utils.needsThumb({ type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,AAA' }), false);
+    assert.equal(utils.needsThumb({ _thumb: true, type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,AAA' }), false);
+    assert.equal(utils.needsThumb({ type: 'image', body: '/9j/ABC' }), false);
+    assert.equal(utils.needsThumb({ type: 'video', body: '/9j/VID' }), false);
+});
+
+test('mediaSource prefers thumbUrl when body is empty', () => {
+    assert.equal(utils.mediaSource({ body: '', thumbUrl: 'data:image/jpeg;base64,THUMB' }), 'data:image/jpeg;base64,THUMB');
+    assert.equal(utils.mediaSource({ body: '', thumbUrl: '' }), '');
+    assert.equal(utils.mediaSource({ body: '' }), '');
+    assert.equal(utils.mediaSource({ thumbUrl: 'data:image/jpeg;base64,THUMB' }), 'data:image/jpeg;base64,THUMB');
+    assert.equal(utils.mediaSource({ body: '/9j/ABC', thumbUrl: 'data:image/jpeg;base64,THUMB' }), 'data:image/jpeg;base64,/9j/ABC');
+});
+
+test('thumbnailize preserves an existing thumbUrl onto the placeholder copy', () => {
+    const big = { id: 'm9', type: 'image', body: '/9j/' + 'A'.repeat(6000), thumbUrl: 'data:image/jpeg;base64,THUMB' };
+    const out = utils.thumbnailize(big, 4096);
+    assert.equal(out._thumb, true);
+    assert.equal(out.body, '');
+    assert.equal(out.thumbUrl, 'data:image/jpeg;base64,THUMB');
+});
+
+test('buildMediaList includes _thumb entries that carry a thumbUrl', () => {
+    const msgs = [
+        { id: 'm1', type: 'chat', body: 'text' },
+        { id: 'm2', type: 'image', body: '/9j/a' },
+        { id: 'm6', _thumb: true, type: 'image', body: '' },
+        { id: 'm7', _thumb: true, type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,THUMB' },
+        { id: 'm8', type: 'image', body: '' },
+        { id: 'm9', type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,THUMB' },
+        { id: 'm10', type: 'video', body: '', thumbUrl: 'data:image/jpeg;base64,THUMB' },
+    ];
+    const out = utils.buildMediaList(msgs);
+    assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm7', 'm9', 'm10']);
+});

@@ -65,6 +65,10 @@ PlasmoidItem {
     property bool   viewerVisible: false    // fullscreen media overlay
     property var    mediaList: []           // viewable media msgs of the open chat
     property int    mediaIndex: 0
+    property var    _thumbInflight: ({})    // msgId|maxEdge -> true (getMedia dedupe)
+    property bool   viewerFullLoading: false // full-res fetch in flight for viewer
+    property string viewerFullSource: ""    // dataUrl of the full-res viewer image
+    property string viewerFullMsgId: ""     // msg id the viewerFullSource belongs to
     property string _pendingOpenChatId: ""  // cold open queued while a poll is in flight
     property int    _waitGen: 0             // wait-loop generation (chat switches)
 
@@ -130,6 +134,10 @@ PlasmoidItem {
 
     // Emoji-supporting font - use Noto Color Emoji if available, fallback to default
     readonly property string emojiFont: "Noto Color Emoji, emoji, monospace"
+
+    onMediaIndexChanged: {
+        if (viewerVisible) viewerLoadFull();
+    }
 
     onActiveChatChanged: {
         root.clearPendingReply();
@@ -531,10 +539,12 @@ PlasmoidItem {
                     // vanishing bubbles when sends and incoming polls race.
                     if (useSince) {
                         root.pollsSinceFull++;
-                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        var mergedInc = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        root.activeChatMessages = root.carryMediaUrls(root.activeChatMessages, mergedInc);
                     } else {
                         root.pollsSinceFull = 0;
-                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        var mergedFull = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        root.activeChatMessages = root.carryMediaUrls(root.activeChatMessages, mergedFull);
                         if (!background) root.msgsHasMore = (r.hasMore === true);
                     }
                     // Keep this chat's MRU cache copy fresh (thumbnailized).
@@ -644,13 +654,132 @@ PlasmoidItem {
         if (!chatId || !messages || messages.length === 0) return;
         var thumbs = [];
         for (var i = 0; i < messages.length; i++) {
-            thumbs.push(MsgUtils.thumbnailize(messages[i], 4096));
+            var t = MsgUtils.thumbnailize(messages[i], 4096);
+            // Persist thumbUrl on the placeholder copy so MRU-cached chats
+            // repaint 480p thumbs instantly (never strip it).
+            if (messages[i] && messages[i].thumbUrl && !t.thumbUrl) {
+                t.thumbUrl = messages[i].thumbUrl;
+            }
+            thumbs.push(t);
         }
         var next = {};
         for (var k in root.msgCache) next[k] = root.msgCache[k];
         next[chatId] = { messages: thumbs, sig: sig || "", savedAt: Date.now() };
         root.msgCache = next;
         root.mruTouch(chatId);
+    }
+
+    // ── 480p media thumbnails via POST /api/getMedia (Slices 2–3) ────────────
+    // Contract: POST {apiHost}/api/getMedia, headers Content-Type
+    // application/json + X-API-Key, body {args:{chatId,msgId,maxEdge}};
+    // success {response:{dataUrl,width,height}}; maxEdge 480 = thumb, 0 = full.
+    function fetchMedia(chatId, msgId, maxEdge, onDone) {
+        if (!root.isConnected || !chatId || !msgId) {
+            if (onDone) onDone("");
+            return;
+        }
+        var key = msgId + "|" + maxEdge;
+        if (root._thumbInflight[key]) return;
+        root._thumbInflight[key] = true;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getMedia");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            var next = {};
+            for (var k in root._thumbInflight) {
+                if (k !== key) next[k] = root._thumbInflight[k];
+            }
+            root._thumbInflight = next;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    var resp = r.response || {};
+                    var url = resp.dataUrl || "";
+                    if (onDone) onDone(url, resp.width || 0, resp.height || 0);
+                } catch(e) {
+                    if (onDone) onDone("");
+                }
+            } else {
+                if (onDone) onDone("");
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, maxEdge: maxEdge } }));
+    }
+
+    // Lazy 480p thumb for one bubble: fetch once when the delegate becomes
+    // visible, then write the dataUrl back onto the live message + MRU copy.
+    function requestThumb(msg) {
+        if (!msg || msg.thumbUrl) return;
+        var need = false;
+        try {
+            need = MsgUtils.needsThumb(msg);
+        } catch(e) {
+            return;
+        }
+        if (!need) return;
+        if (!root.activeChat || !msg.id) return;
+        var chatId = root.activeChat.id;
+        var mid = msg.id;
+        root.fetchMedia(chatId, mid, 480, function(url) {
+            if (!url) return;
+            root.applyThumbUrl(mid, url);
+        });
+    }
+
+    // Write a fetched thumbUrl back onto the live list (reassign to notify
+    // the ListView) and onto the MRU cached copy for instant repaint.
+    function applyThumbUrl(msgId, dataUrl) {
+        if (!msgId || !dataUrl) return;
+        var found = false;
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && msgs[i].id === msgId) {
+                msgs[i].thumbUrl = dataUrl;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+        root.activeChatMessages = msgs.slice();
+        if (root.activeChat) {
+            var cid = root.activeChat.id;
+            var entry = root.msgCache[cid];
+            if (entry && entry.messages) {
+                for (var j = 0; j < entry.messages.length; j++) {
+                    if (entry.messages[j] && entry.messages[j].id === msgId) {
+                        entry.messages[j].thumbUrl = dataUrl;
+                        break;
+                    }
+                }
+                var next = {};
+                for (var k in root.msgCache) next[k] = root.msgCache[k];
+                root.msgCache = next;
+            }
+        }
+    }
+
+    // Carry cached thumbUrl/fullUrl across poll merges so a revalidate
+    // never blanks already-resolved 480p thumbs (poll payloads carry no
+    // media URLs). Pure overlay: message set, order and sort untouched.
+    function carryMediaUrls(oldMsgs, merged) {
+        if (!merged) return merged;
+        var cache = {};
+        for (var i = 0; i < (oldMsgs || []).length; i++) {
+            var o = oldMsgs[i];
+            if (o && o.id && (o.thumbUrl || o.fullUrl)) {
+                cache[o.id] = o;
+            }
+        }
+        for (var j = 0; j < merged.length; j++) {
+            var mm = merged[j];
+            if (mm && mm.id && cache[mm.id]) {
+                if (!mm.thumbUrl && cache[mm.id].thumbUrl) mm.thumbUrl = cache[mm.id].thumbUrl;
+                if (!mm.fullUrl && cache[mm.id].fullUrl) mm.fullUrl = cache[mm.id].fullUrl;
+            }
+        }
+        return merged;
     }
 
     // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
@@ -660,15 +789,96 @@ PlasmoidItem {
         root.mediaList = list;
         root.mediaIndex = startIndex;
         root.viewerVisible = true;
+        root.viewerLoadFull();
     }
 
     function closeMediaViewer() {
         root.viewerVisible = false;
+        root.viewerFullLoading = false;
     }
 
     function viewerStep(d) {
         if (!root.mediaList || root.mediaList.length === 0) return;
         root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
+    }
+
+    // Fetch full-res (maxEdge 0) for the current viewer index with a spinner;
+    // the cached 480p thumb stays painted until the full image arrives.
+    function viewerLoadFull() {
+        var m = null;
+        if (root.mediaList && root.mediaList.length > 0) {
+            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            m = root.mediaList[ci];
+        }
+        if (!m) {
+            root.viewerFullLoading = false;
+            return;
+        }
+        var mid = m.id || "";
+        if (m.fullUrl) {
+            root.viewerFullMsgId = mid;
+            root.viewerFullSource = m.fullUrl;
+            root.viewerFullLoading = false;
+            root.viewerPrefetchNeighbours();
+            return;
+        }
+        if (!root.isConnected || !root.activeChat || !mid) {
+            root.viewerFullLoading = false;
+            return;
+        }
+        root.viewerFullMsgId = mid;
+        root.viewerFullSource = "";
+        root.viewerFullLoading = true;
+        var chatId = root.activeChat.id;
+        root.fetchMedia(chatId, mid, 0, function(url) {
+            var cur = null;
+            if (root.mediaList && root.mediaList.length > 0) {
+                var ni = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+                cur = root.mediaList[ni];
+            }
+            if (!cur || (cur.id || "") !== mid) return;
+            if (url && url !== "") {
+                root.viewerFullSource = url;
+                for (var i = 0; i < root.activeChatMessages.length; i++) {
+                    if (root.activeChatMessages[i] && root.activeChatMessages[i].id === mid) {
+                        root.activeChatMessages[i].fullUrl = url;
+                        break;
+                    }
+                }
+                root.viewerFullLoading = false;
+            } else {
+                root.viewerFullSource = "";
+                root.viewerFullLoading = false;
+            }
+            root.viewerPrefetchNeighbours();
+        });
+    }
+
+    // Low-priority prefetch of full-res for prev/next neighbours; failures
+    // are silent (viewer still shows the cached thumb + retry on revisit).
+    function viewerPrefetchNeighbours() {
+        if (!root.isConnected || !root.activeChat) return;
+        if (!root.mediaList || root.mediaList.length < 2) return;
+        var idx = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+        var chatId = root.activeChat.id;
+        var sides = [idx - 1, idx + 1];
+        for (var s = 0; s < sides.length; s++) {
+            (function(ni) {
+                if (ni < 0 || ni >= root.mediaList.length) return;
+                var nm = root.mediaList[ni];
+                if (!nm || !nm.id || nm.fullUrl) return;
+                var nid = nm.id;
+                root.fetchMedia(chatId, nid, 0, function(url) {
+                    if (!url) return;
+                    for (var i = 0; i < root.mediaList.length; i++) {
+                        if (root.mediaList[i] && root.mediaList[i].id === nid) {
+                            root.mediaList[i].fullUrl = url;
+                            break;
+                        }
+                    }
+                });
+            })(sides[s]);
+        }
     }
 
     function sendMessage(chatId, text) {
@@ -1776,16 +1986,27 @@ PlasmoidItem {
 
                                             Image {
                                                 id: msgImage
-                                                visible: !modelData._thumb && (modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
+                                                visible: (!modelData._thumb || modelData.thumbUrl) && (modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || modelData.thumbUrl || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
                                                 source: {
-                                                    if (!visible || !modelData.body) return "";
-                                                    return MsgUtils.mediaSource(modelData);
+                                                    if (!visible) return "";
+                                                    var s = MsgUtils.mediaSource(modelData);
+                                                    if (s !== "") return s;
+                                                    return modelData.thumbUrl || "";
                                                 }
                                                 fillMode: Image.PreserveAspectFit
                                                 Layout.maximumWidth: messageListView.width * 0.7
                                                 Layout.preferredWidth: Math.min(messageListView.width * 0.7, 240)
                                                 Layout.preferredHeight: Math.min(messageListView.width * 0.7, 180)
                                                 asynchronous: true
+
+                                                // Lazy 480p thumb: fetch once when the
+                                                // delegate becomes visible.
+                                                onVisibleChanged: {
+                                                    if (visible) root.requestThumb(modelData);
+                                                }
+                                                Component.onCompleted: {
+                                                    if (visible) root.requestThumb(modelData);
+                                                }
 
                                                 // Tap to open the fullscreen viewer.
                                                 MouseArea {
@@ -1805,7 +2026,7 @@ PlasmoidItem {
                                             // media (thumbnailized); the full body
                                             // returns after revalidation.
                                             PlasmaComponents.Label {
-                                                visible: !!modelData._thumb
+                                                visible: !!modelData._thumb && !modelData.thumbUrl
                                                 text: MsgUtils.mediaLabel(modelData.type) || "📷 Media"
                                                 font.pointSize: 9
                                                 color: root.colSub
@@ -2473,12 +2694,30 @@ PlasmoidItem {
                     anchors.centerIn: parent
                     source: {
                         var m = mediaViewer.currentMsg();
-                        return m ? MsgUtils.mediaSource(m) : "";
+                        if (!m) return "";
+                        if (root.viewerFullMsgId !== "" && root.viewerFullMsgId === m.id && root.viewerFullSource !== "")
+                            return root.viewerFullSource;
+                        var s = MsgUtils.mediaSource(m);
+                        if (s !== "") return s;
+                        return m.thumbUrl || "";
                     }
                     fillMode: Image.PreserveAspectFit
                     scale: viewerStage.vScale
                     transform: Translate { x: viewerStage.vTx; y: viewerStage.vTy }
                     asynchronous: true
+
+                    // Loading overlay while the full-res image arrives; the
+                    // cached 480p thumb stays painted underneath.
+                    PlasmaComponents.Label {
+                        anchors.centerIn: parent
+                        visible: root.viewerFullLoading
+                        text: "Loading full resolution…"
+                        color: "#ffffff"
+                        font.pointSize: 9
+                        style: Text.Outline
+                        styleColor: "#80000000"
+                        z: 5
+                    }
 
                     PlasmaComponents.Label {
                         anchors.centerIn: parent

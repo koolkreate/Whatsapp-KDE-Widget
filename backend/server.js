@@ -18,6 +18,7 @@ const puppeteer = require('./node_modules/puppeteer-core');
 const replyLib = require('./lib/reply');
 const avatarsLib = require('./lib/avatars');
 const messagesLib = require('./lib/messages');
+const mediaLib = require('./lib/media');
 const pinsLib = require('./lib/pins');
 const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
@@ -898,6 +899,69 @@ app.get('/api/avatar/:hash', (req, res) => {
     res.set('Content-Type', isPng ? 'image/png' : 'image/jpeg');
     res.set('Cache-Control', 'private, max-age=86400, immutable');
     res.send(buf);
+});
+
+// ── getMedia (on-demand image bytes, downscaled in-page) ───────────────────
+// POST /api/getMedia { chatId, msgId, maxEdge } →
+//   { response: { dataUrl, width, height } }.
+// maxEdge=480 caps the longest edge at 480px; maxEdge=0 is full resolution.
+// Served from a ~30MB server-side LRU (key chatId|msgId|maxEdge).
+// Errors: 400 missing params, 404 msg not loaded, 502 download failed,
+// 503 backend not ready. In-page fn is toString-injected (this
+// puppeteer-core build does not forward page.evaluate args), so it must
+// stay fully self-contained — see lib/media.js getMediaInPage.
+app.post('/api/getMedia', async (req, res) => {
+    const parsed = mediaLib.parseMediaArgs(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const chatId = parsed.chatId;
+    const msgId = parsed.msgId;
+    const maxEdge = parsed.maxEdge;
+
+    try {
+        const page = await getValidPage();
+        if (!isReady || !page) return res.status(503).json({ error: 'Not ready' });
+
+        const key = mediaLib.cacheKey(chatId, msgId, maxEdge);
+        const hit = mediaLib.mediaCache.get(key);
+        if (hit && hit.dataUrl) {
+            return res.json({ response: { dataUrl: hit.dataUrl, width: hit.width, height: hit.height } });
+        }
+
+        // Inject args as a JSON literal — page.evaluate args arrive
+        // undefined in this build, so the in-page fn takes none.
+        const payload = JSON.stringify({ chatId: chatId, msgId: msgId, maxEdge: maxEdge });
+        const src = '(' + mediaLib.getMediaInPage.toString() + ')(' + payload + ');';
+        const result = await Promise.race([
+            page.evaluate(new Function('return ' + src)),
+            new Promise(function (_, reject) {
+                setTimeout(function () { reject(new Error('getMedia timed out')); }, 30000);
+            }),
+        ]);
+
+        if (!result || result.error) {
+            const detail = result && result.error ? String(result.error) : '';
+            if (detail.indexOf('NOT_FOUND') === 0) {
+                return res.status(404).json({ error: 'Message not loaded: ' + detail });
+            }
+            if (detail.indexOf('DOWNLOAD_FAILED') === 0 || /timed out/.test(detail)) {
+                return res.status(502).json({ error: 'Media download failed: ' + detail });
+            }
+            return res.status(502).json({ error: 'Media download failed: ' + detail });
+        }
+        if (!result.dataUrl) return res.status(502).json({ error: 'Media download failed: ' + detail });
+
+        mediaLib.mediaCache.put(key, {
+            dataUrl: result.dataUrl,
+            width: result.width,
+            height: result.height,
+        });
+        res.json({ response: { dataUrl: result.dataUrl, width: result.width, height: result.height } });
+    } catch (e) {
+        const msg = String((e && e.message) || e);
+        if (/timed out/.test(msg)) return res.status(502).json({ error: 'Media download failed' });
+        console.error('getMedia error:', msg);
+        res.status(500).json({ error: msg });
+    }
 });
 
 // ── QR code bytes (GET, key via query so QML Image can pass ?key=) ──────────
@@ -1804,6 +1868,7 @@ app.post('/api/logout', async (_req, res) => {
         currentOpenChatId = null;
         msgCache.clear();
         avatarStore.clear();
+        mediaLib.mediaCache.clear();
         try { fs.unlinkSync(QR_PATH); } catch (_) { }
         if (waPage) {
             try {
