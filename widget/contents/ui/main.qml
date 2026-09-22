@@ -2185,7 +2185,10 @@ PlasmoidItem {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-                    ScrollBar.vertical: ScrollBar { }
+                    ScrollBar.vertical: ScrollBar {
+                        policy: ScrollBar.AsNeeded
+                        background: Item {}
+                    }
                     model: root.filteredChats.slice(0, root.chatsShown)
                         spacing: 0
                         // NOTE: deliberately NO reuseItems here (same lesson
@@ -2469,7 +2472,10 @@ PlasmoidItem {
                     objectName: "messageListView"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    ScrollBar.vertical: ScrollBar { }
+                    ScrollBar.vertical: ScrollBar {
+                        policy: ScrollBar.AsNeeded
+                        background: Item {}
+                    }
                     Component.onCompleted: root.msgListViewRef = messageListView
                         model: root.activeChatMessages
                         spacing: 4
