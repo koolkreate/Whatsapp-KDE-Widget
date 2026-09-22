@@ -12,9 +12,27 @@ function isMediaMessage(msg) {
     var type = msg.type || '';
     if (type === 'image' || type === 'video' || type === 'audio' ||
         type === 'document' || type === 'sticker') return true;
-    var b = msg.body || '';
-    // Raw media bodies rendered as an image by the widget.
-    return b.indexOf('/9j/') === 0 || b.indexOf('data:image') === 0 || b.indexOf('iVBORw0KGgo') === 0;
+    return isMediaBody(msg.body);
+}
+
+// Whether a raw body string IS the media bytes themselves (base64 jpeg/png
+// or a data: URL) rather than human-readable text. WhatsApp media messages
+// carry their caption in `body`, so the body content — not just the type —
+// decides how a message must be rendered.
+function isMediaBody(body) {
+    var b = typeof body === 'string' ? body : '';
+    if (!b) return false;
+    return b.indexOf('/9j/') === 0 || b.indexOf('data:image') === 0 ||
+           b.indexOf('data:video') === 0 || b.indexOf('iVBORw0KGgo') === 0;
+}
+
+// Human-readable caption of a media message: the body when it is real text
+// (photo/video captions, audio transcriptions), '' when the body is the
+// media bytes themselves or empty.
+function mediaCaption(msg) {
+    if (!msg) return '';
+    var b = typeof msg.body === 'string' ? msg.body : (msg.caption ? String(msg.caption) : '');
+    return isMediaBody(b) ? '' : b;
 }
 
 function mediaLabel(type) {
@@ -34,6 +52,15 @@ function mediaLabel(type) {
 function copyTextForMessage(msg) {
     if (!msg) return '';
     if (isMediaMessage(msg)) {
+        // A captioned photo/video copies its caption text, like WhatsApp
+        // does. Documents keep the type label (their body is the file name,
+        // which the bubble already shows as text).
+        var visual = msg.type === 'image' || msg.type === 'video' || msg.type === 'sticker' ||
+                     isMediaBody(typeof msg.body === 'string' ? msg.body : '');
+        if (visual) {
+            var cap = mediaCaption(msg);
+            if (cap) return cap;
+        }
         var label = mediaLabel(msg.type);
         // Raw media bodies (e.g. base64) have no dedicated type label yet.
         return label || '📷 Photo';
@@ -47,6 +74,15 @@ function replyPreviewText(msg, maxChars) {
     if (!msg) return '';
     var max = (maxChars && maxChars > 0) ? maxChars : 60;
     if (isMediaMessage(msg)) {
+        var visual = msg.type === 'image' || msg.type === 'video' || msg.type === 'sticker' ||
+                     isMediaBody(typeof msg.body === 'string' ? msg.body : '');
+        if (visual) {
+            var cap = mediaCaption(msg);
+            if (cap) {
+                if (cap.length > max) return cap.substring(0, max - 1) + '…';
+                return cap;
+            }
+        }
         return mediaLabel(msg.type) || '📷 Photo';
     }
     var body = String(msg.body || msg.content || '');
@@ -97,9 +133,16 @@ function thumbnailize(msg, maxLen) {
     return copy;
 }
 
+// Bodies shorter than this are WhatsApp's inline ~37×60 "micro-thumb"
+// (unreadable when upscaled to bubble size), not a usable preview. Anything
+// longer is a real inline image worth showing as-is.
+var MICRO_BODY_MAX = 4096;
+
 // Whether a bubble needs a 480p thumb fetch: image/video/sticker msgs that
-// lack both a usable full body and a thumbUrl. Text msgs and msgs already
-// carrying a thumbUrl or a non-empty body do not need a fetch.
+// lack a thumbUrl and have no usable preview body — i.e. an empty body OR
+// only WhatsApp's micro-thumb (short base64 body). Text msgs, msgs already
+// carrying a thumbUrl, and msgs with a large inline image body do not need
+// a fetch.
 function needsThumb(msg) {
     if (!msg || typeof msg !== 'object') return false;
     var type = msg.type || '';
@@ -107,17 +150,18 @@ function needsThumb(msg) {
     var tu = typeof msg.thumbUrl === 'string' ? msg.thumbUrl : (msg.thumbUrl ? String(msg.thumbUrl) : '');
     if (tu.length > 0) return false;
     var b = typeof msg.body === 'string' ? msg.body : (msg.body ? String(msg.body) : '');
-    if (b.length > 0) return false;
-    return true;
+    return b.length < MICRO_BODY_MAX;
 }
 
-// Build a data-URL for a media message body (extracted from the QML
-// msgImage.source logic). Fallback order: full body data-URL when the body
-// is non-empty, else thumbUrl when present, else ''.
+// Build a data-URL for a media message body. Fallback order: full body
+// data-URL when the body actually IS image bytes, else thumbUrl when
+// present, else ''. A captioned media message (body is text) must never be
+// prefixed into a broken "data:image/jpeg;base64,<caption>" URL — it renders
+// via its thumbUrl instead.
 function mediaSource(msg) {
     if (!msg) return '';
     var b = typeof msg.body === 'string' ? msg.body : '';
-    if (b) {
+    if (isMediaBody(b)) {
         if (b.indexOf('data:') === 0) return b;
         var prefix = 'data:image/jpeg;base64,';
         if (b.indexOf('iVBORw0KGgo') === 0) prefix = 'data:image/png;base64,';
@@ -126,6 +170,20 @@ function mediaSource(msg) {
     var tu = typeof msg.thumbUrl === 'string' ? msg.thumbUrl : (msg.thumbUrl ? String(msg.thumbUrl) : '');
     if (tu) return tu;
     return '';
+}
+
+// Best available still preview for bubbles and viewer placeholders.
+// Priority: a fetched 480p thumbUrl beats WhatsApp's micro-thumb/empty body;
+// a large inline body (> MICRO_BODY_MAX chars, a real preview) beats the
+// thumb; whatever exists wins otherwise.
+function mediaPreviewSource(msg) {
+    if (!msg) return '';
+    var b = typeof msg.body === 'string' ? msg.body : '';
+    var tu = typeof msg.thumbUrl === 'string' ? msg.thumbUrl : (msg.thumbUrl ? String(msg.thumbUrl) : '');
+    if (tu && b.length < MICRO_BODY_MAX) return tu;
+    var s = mediaSource(msg);
+    if (s) return s;
+    return tu;
 }
 
 // All image/video/sticker messages in chat order — used for the fullscreen
@@ -181,6 +239,8 @@ function compareChats(a, b, isPinned) {
 // Node export (ignored by QML, where `module` is undefined).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
+        isMediaBody: isMediaBody,
+        mediaCaption: mediaCaption,
         isMediaMessage: isMediaMessage,
         mediaLabel: mediaLabel,
         copyTextForMessage: copyTextForMessage,
@@ -190,6 +250,7 @@ if (typeof module !== 'undefined' && module.exports) {
         compareChats: compareChats,
         thumbnailize: thumbnailize,
         mediaSource: mediaSource,
+        mediaPreviewSource: mediaPreviewSource,
         buildMediaList: buildMediaList,
         needsThumb: needsThumb
     };

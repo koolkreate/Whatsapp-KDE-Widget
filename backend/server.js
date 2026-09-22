@@ -174,6 +174,59 @@ app.use((req, res, next) => {
 // lib/avatars.js pattern. The two helpers are injected the same way.
 function getAllChatsInPage(extractLastMessage, extractChatListRows) {
 
+    // ── Contact collection for chat-name resolution ──────────────────────
+    // LID-migrated 1-1 chats carry the raw phone number in formattedTitle
+    // while the saved contact name lives on chat.contact / the contact
+    // collection. Located once, used by resolveChatName below.
+    let nameColl = null;
+    try {
+        if (typeof window.require !== 'undefined') {
+            const contactMod = window.require('WAWebContactCollection');
+            const cc = contactMod.ContactCollection || contactMod.ContactCollectionImpl;
+            if (cc && typeof cc.get === 'function') nameColl = cc;
+        }
+    } catch (e) { }
+
+    // Prefer the chat's own title unless it is empty or number-like; then
+    // prefer the saved contact name (chat.contact, else collection lookup
+    // by chat id). Never throws and never blanks: worst case the raw title
+    // survives, so unsaved contacts keep showing their number.
+    function looksLikeNumber(s) {
+        var t = String(s == null ? '' : s).trim();
+        if (t.length < 5) return false;
+        if (/[a-zA-Z]/.test(t)) return false;
+        var digits = t.replace(/\D/g, '');
+        return digits.length >= 5;
+    }
+    function contactDisplayName(contact) {
+        if (!contact) return '';
+        var n = null;
+        try {
+            n = contact.name || contact.pushname || contact.verifiedName ||
+                contact.formattedName || contact.shortName || '';
+        } catch (e) { n = ''; }
+        return n || '';
+    }
+    function resolveChatName(chat, rawName) {
+        try {
+            var name = String(rawName == null ? '' : rawName);
+            if (name && !looksLikeNumber(name)) return name;
+            var contact = null;
+            try { contact = (chat && chat.contact) || null; } catch (e) { contact = null; }
+            if (!contact && nameColl) {
+                try {
+                    var cid = chat && chat.id;
+                    var key = (cid && cid._serialized) || cid;
+                    if (key) contact = nameColl.get(String(key));
+                } catch (e) { contact = null; }
+            }
+            var resolved = contactDisplayName(contact);
+            return resolved || name;
+        } catch (e) {
+            return String(rawName == null ? '' : rawName);
+        }
+    }
+
     // ── Method 1: WAWebChatCollection singleton ──────────────────────────
     try {
         const mod = window.require('WAWebChatCollection');
@@ -182,7 +235,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
         if (coll && typeof coll.getModelsArray === 'function') {
             return coll.getModelsArray().map(c => ({
                 id: c.id && c.id._serialized || String(c.id),
-                name: c.formattedTitle || c.name || '',
+                name: resolveChatName(c, c.formattedTitle || c.name || ''),
                 formattedTitle: c.formattedTitle || '',
                 isGroup: !!c.isGroup,
                 isPinned: !!(c.pin || c.isPinned),
@@ -204,7 +257,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
                 if (d && typeof d.getModelsArray === 'function') {
                     return d.getModelsArray().map(c => ({
                         id: c.id && c.id._serialized || String(c.id),
-                        name: c.formattedTitle || c.name || '',
+                        name: resolveChatName(c, c.formattedTitle || c.name || ''),
                         formattedTitle: c.formattedTitle || '',
                         isGroup: !!c.isGroup,
                         isPinned: !!(c.pin || c.isPinned),
@@ -244,7 +297,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
                             seen.add(chat.id._serialized);
                             results.push({
                                 id: chat.id._serialized,
-                                name: chat.formattedTitle || chat.name || '',
+                                name: resolveChatName(chat, chat.formattedTitle || chat.name || ''),
                                 formattedTitle: chat.formattedTitle || '',
                                 isGroup: !!chat.isGroup,
                                 isPinned: !!(chat.pin || chat.isPinned),
@@ -308,6 +361,9 @@ app.post('/api/getAllChats', async (req, res) => {
             'return (' + getAllChatsInPage.toString() + ')(' +
                 chatPreviewLib.extractLastMessage.toString() + ',' +
                 chatPreviewLib.extractChatListRows.toString() + ');'));
+        for (const c of chats) {
+            if (!c.isGroup && chatPreviewLib.isGroupChat(c)) c.isGroup = true;
+        }
         const withPreview = chats.filter(c => c.lastMessage && c.lastMessage.body).length;
         console.log(`getAllChats: returned ${chats.length} chats (${withPreview} with preview)`);
         res.json({ response: chats });
@@ -513,6 +569,56 @@ app.post('/api/getChatMessages', async (req, res) => {
                 chat = chatMod.get(cid);
             }
 
+            // ── Contact collection for sender resolution ─────────────────────
+            // Current WA builds leave msg.sender null; the sender's LID sits
+            // in msg.author and resolves to a display name through here.
+            let contactColl = null;
+            try {
+                if (typeof window.require !== 'undefined') {
+                    const contactMod = window.require('WAWebContactCollection');
+                    const cc = contactMod.ContactCollection || contactMod.ContactCollectionImpl;
+                    if (cc && typeof cc.get === 'function') contactColl = cc;
+                }
+            } catch (e) { }
+
+            // One sender-name rule for every extraction site below: legacy
+            // sender model first, then author-LID contact lookup, then the
+            // phone-number fallback. Never throws (the page must not die).
+            function resolveSenderName(sender, author) {
+                try {
+                    if (sender && typeof sender === 'object') {
+                        const direct = sender.formattedTitle || sender.pushname || sender.formattedName ||
+                            sender.name || sender.shortName || sender.notifyName ||
+                            ((sender.id && sender.id.user) || '');
+                        if (direct) return direct;
+                    }
+                    let authorId = '';
+                    if (typeof author === 'string') authorId = author;
+                    else if (author && typeof author === 'object') {
+                        authorId = author._serialized || author.user || '';
+                    }
+                    authorId = String(authorId || '');
+                    if (authorId && contactColl) {
+                        try {
+                            const contact = contactColl.get(authorId);
+                            if (contact) {
+                                const named = contact.pushname || contact.verifiedName ||
+                                    contact.formattedName || contact.name || contact.shortName || '';
+                                if (named) return named;
+                            }
+                        } catch (e) { }
+                    }
+                    if (authorId) {
+                        const at = authorId.indexOf('@');
+                        const domain = at !== -1 ? authorId.substring(at + 1) : '';
+                        if (domain === 'c.us' || domain === 's.whatsapp.net') {
+                            return authorId.substring(0, at);
+                        }
+                    }
+                } catch (e) { }
+                return '';
+            }
+
             // Select the chat to make sure messages are loaded
             let selectedViaDOM = false;
             if (!alreadyOpen) {
@@ -571,31 +677,28 @@ app.post('/api/getChatMessages', async (req, res) => {
             if (chat && chat.msgs && typeof chat.msgs.getModelsArray === 'function') {
                 try {
                     msgs = chat.msgs.getModelsArray().map(m => {
-                        let senderName = '';
-                        if (m.sender) {
-                            senderName = m.sender.formattedName || m.sender.name || m.sender.id.user || '';
-                        }
+                        const senderName = resolveSenderName(m.sender, m.author || m.participant);
                         // Collect reactions if present.
-                        // WA's reaction model exposes the emoji under `orphan`
-                        // (aggregation key) or `emoji`; `sent_by_me` and the
-                        // MaybeMeUser comparison give a reliable `fromMe`.
-                        let reactions = [];
-                        try {
-                            if (m.reactions && m.reactions.length > 0) {
-                                const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
-                                reactions = m.reactions.map(r => {
-                                    const emoji = r.orphan || r.emoji || r.reactionText || '';
-                                    let fromMe = !!r.sent_by_me;
-                                    try {
-                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
-                                        if (me && sid) fromMe = fromMe || String(sid) === me;
-                                    } catch (_) { }
-                                    return {
-                                        emoji: emoji,
-                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
-                                        fromMe: fromMe,
-                                    };
-                                }).filter(r => r.emoji);
+                                // WA's reaction model exposes the emoji under `orphan`
+                                // (aggregation key) or `emoji`; `sent_by_me` and the
+                                // MaybeMeUser comparison give a reliable `fromMe`.
+                                let reactions = [];
+                                try {
+                                    if (m.reactions && m.reactions.length > 0) {
+                                        const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
+                                        reactions = m.reactions.map(r => {
+                                            const emoji = r.orphan || r.emoji || r.reactionText || '';
+                                            let fromMe = !!r.sent_by_me;
+                                            try {
+                                                const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                                if (me && sid) fromMe = fromMe || String(sid) === me;
+                                            } catch (_) { }
+                                            return {
+                                                emoji: emoji,
+                                                sender: resolveSenderName(r.sender, null),
+                                                fromMe: fromMe,
+                                            };
+                                        }).filter(r => r.emoji);
                             }
                         } catch (_) { }
                         // Extract quoted (replied-to) message if present
@@ -603,9 +706,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                         try {
                             const qm = m.quotedMsg || (m.quotedStanzaInfo && m.quotedStanzaInfo.quotedMsg);
                             if (qm) {
-                                let qSender = '';
-                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
-                                else if (m.quotedParticipant) qSender = m.quotedParticipant.user || String(m.quotedParticipant) || '';
+                                let qSender = resolveSenderName(qm.sender, qm.author);
+                                if (!qSender && m.quotedParticipant) qSender = m.quotedParticipant.user || String(m.quotedParticipant) || '';
                                 quotedMsg = {
                                     body: qm.body || qm.content || qm.caption || '',
                                     type: qm.type || 'chat',
@@ -616,6 +718,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                         return {
                             id: m.id && m.id._serialized || String(m.id || Math.random()),
                             body: m.body || m.content || '',
+                            caption: m.caption || '',
                             type: m.type || 'chat',
                             t: m.t || 0,
                             fromMe: !!(m.id && m.id.fromMe),
@@ -646,13 +749,10 @@ app.post('/api/getChatMessages', async (req, res) => {
                                 seen.add(f); depth++;
                                 const props = f.memoizedProps;
                                 if (props) {
-                                    const msg = props.message || props.msg;
-                                    if (msg && msg.id && msg.id._serialized && !seen.has(msg.id._serialized)) {
-                                        seen.add(msg.id._serialized);
-                                        let senderName = '';
-                                        if (msg.sender) {
-                                            senderName = msg.sender.formattedName || msg.sender.name || msg.sender.id.user || '';
-                                        }
+                                        const msg = props.message || props.msg;
+                                        if (msg && msg.id && msg.id._serialized && !seen.has(msg.id._serialized)) {
+                                            seen.add(msg.id._serialized);
+                                            const senderName = resolveSenderName(msg.sender, msg.author || msg.participant);
                                         // Collect reactions (same rules as Method A).
                                         let reactions = [];
                                         try {
@@ -667,7 +767,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                                                     } catch (_) { }
                                                     return {
                                                         emoji: emoji,
-                                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
+                                                        sender: resolveSenderName(r.sender, null),
                                                         fromMe: fromMe,
                                                     };
                                                 }).filter(r => r.emoji);
@@ -678,9 +778,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                                         try {
                                             const qm = msg.quotedMsg || (msg.quotedStanzaInfo && msg.quotedStanzaInfo.quotedMsg);
                                             if (qm) {
-                                                let qSender = '';
-                                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
-                                                else if (msg.quotedParticipant) qSender = msg.quotedParticipant.user || String(msg.quotedParticipant) || '';
+                                                let qSender = resolveSenderName(qm.sender, qm.author);
+                                                if (!qSender && msg.quotedParticipant) qSender = msg.quotedParticipant.user || String(msg.quotedParticipant) || '';
                                                 quotedMsg = {
                                                     body: qm.body || qm.content || qm.caption || '',
                                                     type: qm.type || 'chat',
@@ -691,6 +790,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                                         results.push({
                                             id: msg.id._serialized,
                                             body: msg.body || msg.content || '',
+                                            caption: msg.caption || '',
                                             type: msg.type || 'chat',
                                             t: msg.t || 0,
                                             fromMe: !!(msg.id && msg.id.fromMe),
@@ -1973,18 +2073,26 @@ async function launch() {
 
     fs.mkdirSync(DATA_DIR, { recursive: true });
 
-    // Clean up SingletonLock if it exists to prevent Chrome startup failures
-    const lockPath = path.join(DATA_DIR, 'SingletonLock');
-    if (fs.existsSync(lockPath)) {
-        try {
-            fs.unlinkSync(lockPath);
-            console.log('[HEAL] Removed leftover SingletonLock file.');
-        } catch (e) {
-            console.error('[HEAL] Failed to remove SingletonLock file:', e.message);
+    // Clean up stale Singleton files (Lock/Socket/Cookie) so Chrome can start.
+    // A lock left by a dead (or half-dead) instance otherwise aborts the launch
+    // with "Failed to create SingletonLock: File exists (17)".
+    const SINGLETON_FILES = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+    const clearSingletons = () => {
+        for (const f of SINGLETON_FILES) {
+            const p = path.join(DATA_DIR, f);
+            try {
+                if (fs.existsSync(p)) {
+                    fs.unlinkSync(p);
+                    console.log('[HEAL] Removed leftover ' + f + ' file.');
+                }
+            } catch (e) {
+                console.error('[HEAL] Failed to remove ' + f + ':', e.message);
+            }
         }
-    }
+    };
+    clearSingletons();
 
-    browser = await puppeteer.launch({
+    const launchOpts = {
         executablePath: CHROME,
         headless: true,
         userDataDir: DATA_DIR,
@@ -1996,7 +2104,21 @@ async function launch() {
             '--window-size=1280,800',
         ],
         defaultViewport: { width: 1280, height: 800 },
-    });
+    };
+
+    try {
+        browser = await puppeteer.launch(launchOpts);
+    } catch (e) {
+        // Chrome refused to start — usually a profile lock held by a half-dead
+        // instance that lost its CDP connection. Kill anything bound to this
+        // profile dir, clear the locks again, and retry exactly once.
+        console.error('[HEAL] Chrome launch failed:', e.message);
+        console.log('[HEAL] Killing stale chrome bound to this profile and retrying once…');
+        try { exec('pkill -f "' + DATA_DIR + '"'); } catch (_) { }
+        await new Promise(r => setTimeout(r, 2500));
+        clearSingletons();
+        browser = await puppeteer.launch(launchOpts);
+    }
 
     const pages = await browser.pages();
     waPage = pages[0] || await browser.newPage();

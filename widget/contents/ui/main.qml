@@ -55,6 +55,39 @@ PlasmoidItem {
     property string pendingAttachmentPath: "" // pasted image waiting to be sent
     property bool   copyToastVisible: false
 
+    // ── Agent test workflow (agent_test.sh) ──────────────────────────────────
+    // The driver (testDriver.js) is loaded dynamically on completion, and
+    // only activates when a test-config.json sits next to main.qml — a file
+    // that exists solely in the scratch widget package the test script
+    // builds. Normal installs have neither file, so this block is a no-op
+    // there. Never set these by hand.
+    property bool   testMode: false
+    property var    testCfg: null
+    property Item   msgListViewRef: null  // captured by the ListView on completion
+
+    // Reliable access to the messages ListView: the `messageListView` id is
+    // not resolvable from every call path (XHR closures, imported JS), so
+    // code that scrolls must go through this helper.
+    function getMsgListView() {
+        if (root.msgListViewRef) return root.msgListViewRef;
+        try {
+            if (typeof messageListView !== "undefined" && messageListView) return messageListView;
+        } catch (e) { }
+        return null;
+    }
+
+    Component.onCompleted: {
+        var driverHost = null;
+        try {
+            driverHost = Qt.createQmlObject(
+                'import QtQuick; import "testDriver.js" as TestDriver; QtObject { function start(r) { TestDriver.maybeStart(r); } }',
+                root, "TestDriverHost");
+        } catch (e) { driverHost = null; }
+        if (driverHost) {
+            try { driverHost.start(root); } catch (e) { }
+        }
+    }
+
     // ── Lazy-load + MRU cache + media viewer (Slices 2–4) ────────────────────
     property int    chatsShown: 20          // chat-list window size (scroll grows it)
     property bool   msgsHasMore: false      // older messages exist for the open chat
@@ -70,7 +103,7 @@ PlasmoidItem {
     property bool   viewerFullFailed: false // full-res fetch failed (retry cue)
     property string viewerFullSource: ""    // dataUrl of the full-res viewer image
     property string viewerFullMsgId: ""     // msg id the viewerFullSource belongs to
-    property string viewerOpenError: ""     // transient openExternally failure text
+    property string externalOpenToast: ""   // bubble-tap external open status/error toast
     property string _pendingOpenChatId: ""  // cold open queued while a poll is in flight
     property int    _waitGen: 0             // wait-loop generation (chat switches)
 
@@ -148,6 +181,7 @@ PlasmoidItem {
         root.pollStreak = 0;
         root.pollsSinceFull = 0;
         root.msgsTopError = "";
+        root._pendingOlderFetch = "";
         if (activeChat !== null) {
             root._waitGen++;
             root.waitLoopRunning = false;
@@ -454,7 +488,13 @@ PlasmoidItem {
                 try {
                     var r = JSON.parse(xhr.responseText);
                     changed = !!r.changed;
-                    if (r.sig && r.sig !== root.lastMsgSig) root.lastMsgSig = r.sig;
+                    // Only refresh the sig baseline on no-change timeouts.
+                    // When changed=true the sig must be left alone: the
+                    // follow-up fetch computes the same sig and would see
+                    // "sig === lastMsgSig" and SKIP the merge — messages
+                    // would silently never appear until a full refresh
+                    // (which then swaps the model and teleports the scroll).
+                    if (!changed && r.sig && r.sig !== root.lastMsgSig) root.lastMsgSig = r.sig;
                 } catch (e) { }
             }
             if (xhr.status === 200 && changed && root.activeChat && root.activeChat.id === chatId) {
@@ -519,6 +559,31 @@ PlasmoidItem {
                 fetchMessages(pending, false);
                 return;
             }
+            // Drain a queued top-edge pagination that was blocked by an
+            // in-flight poll (its atYBeginningChanged trigger is gone).
+            // Guards: never refetch while a settle is re-pinning the view
+            // (anchorHold) — the previous prepend may have just landed and the
+            // view is still at the top only transiently; requeue instead and
+            // let a later poll decide once the restore has moved the view off
+            // the top. Cancel outright when the user scrolled away.
+            var pendingOlder = root._pendingOlderFetch;
+            if (pendingOlder && (!root.activeChat || root.activeChat.id !== pendingOlder)) {
+                root._pendingOlderFetch = "";
+            } else if (pendingOlder && root.msgsLoadingOlder) {
+                // still loading — keep queued
+            } else if (pendingOlder && !root.msgsHasMore) {
+                root._pendingOlderFetch = "";
+            } else if (pendingOlder && root.anchorHold) {
+                // keep queued — retry on a later poll
+            } else if (pendingOlder) {
+                var lvNow = root.getMsgListView();
+                if (lvNow && lvNow.atYBeginning) {
+                    root._pendingOlderFetch = "";
+                    fetchOlderMessages();
+                } else {
+                    root._pendingOlderFetch = "";
+                }
+            }
             // Discard responses for a chat that is no longer open — they must
             // never merge into another chat's view.
             if (root.activeChat === null || root.activeChat.id !== chatId) return;
@@ -532,35 +597,33 @@ PlasmoidItem {
                     if (background && sig === root.lastMsgSig) return;
                     root.lastMsgSig = sig;
                     root.pollStreak = 0;
-                    var wasAtEnd = (typeof messageListView !== "undefined" && messageListView && messageListView.atYEnd);
                     // Always merge against the LIVE list (not the snapshot
                     // taken at request time): an optimistic send may have
                     // appended a temp bubble while this request was in flight.
                     // settleMessages() preserves unconfirmed temp sends and
                     // drops temps the server has confirmed — no duplicates or
                     // vanishing bubbles when sends and incoming polls race.
+                    // applyMessagesModel() keeps the scroll position stable
+                    // across the model swap (follows the bottom only when the
+                    // user was already reading the latest messages).
                     if (useSince) {
                         root.pollsSinceFull++;
                         var mergedInc = PollUtils.settleMessages(root.activeChatMessages, fresh);
-                        root.activeChatMessages = root.carryMediaUrls(root.activeChatMessages, mergedInc);
+                        root.applyMessagesModel(root.carryMediaUrls(root.activeChatMessages, mergedInc));
                     } else {
                         root.pollsSinceFull = 0;
                         var mergedFull = PollUtils.settleMessages(root.activeChatMessages, fresh);
-                        root.activeChatMessages = root.carryMediaUrls(root.activeChatMessages, mergedFull);
-                        if (!background) root.msgsHasMore = (r.hasMore === true);
+                        root.applyMessagesModel(root.carryMediaUrls(root.activeChatMessages, mergedFull));
+                        if (!background) {
+                            root.msgsHasMore = (r.hasMore === true);
+                            if (root.testMode) console.warn("WIDDBG hasMore-set: " + root.msgsHasMore +
+                                " background=" + background + " useSince=" + useSince +
+                                " fresh=" + fresh.length + " r.hasMore=" + r.hasMore);
+                        }
                     }
                     // Keep this chat's MRU cache copy fresh (thumbnailized).
                     if (root.activeChat && root.activeChat.id === chatId) {
                         root.mruStore(chatId, root.activeChatMessages, sig);
-                    }
-                    // Scroll to bottom after updating, but only when the user
-                    // was already reading the latest messages.
-                    if (wasAtEnd) {
-                        Qt.callLater(function() {
-                            if (typeof messageListView !== "undefined" && messageListView) {
-                                messageListView.positionViewAtEnd();
-                            }
-                        });
                     }
                 } catch(e) {
                     console.log("Parse messages error:", e);
@@ -577,12 +640,185 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: args }));
     }
 
+    // ── Scroll-stable model swap ──────────────────────────────────────────────
+    // The message model is a plain JS array, so every reassignment resets the
+    // ListView and the view can visibly jump ("teleport") — e.g. mid-swipe,
+    // when a background poll merge or a late thumbnail lands. This helper
+    // snapshots the scroll state first and restores it right after the swap:
+    //  - reading the latest messages (at the end, hands off the gestures) →
+    //    follow new messages to the bottom,
+    //  - anywhere else → re-pin the topmost visible bubble (by message id +
+    //    viewport offset), accurate even though contentHeight is partly
+    //    estimated for not-yet-instantiated delegates.
+    // swapInFlight marks the one-frame reset window: during it the ListView
+    // reports contentY=0 / atYBeginning=true spuriously, which must not
+    // auto-trigger top-edge pagination.
+    property bool swapInFlight: false
+    property int  scrollRestoreGen: 0   // supersedes in-flight scroll-restore loops
+    property bool anchorHold: false     // a scroll-restore settle is re-pinning the view
+    property string _pendingOlderFetch: "" // older-page fetch queued behind an in-flight poll
+
+    // Locate an instantiated message-bubble delegate by message id.
+    function findBubbleDelegateIn(item, msgId) {
+        if (!item) return null;
+        if (item.objectName === "msgBubbleDelegate" && item.testMsgId === msgId) return item;
+        var kids = item.children || [];
+        for (var i = 0; i < kids.length; i++) {
+            var hit = findBubbleDelegateIn(kids[i], msgId);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    function findBubbleDelegate(lv, msgId) {
+        if (!lv || !lv.contentItem) return null;
+        return findBubbleDelegateIn(lv.contentItem, msgId);
+    }
+
+    // {id, off}: topmost visible bubble and how far below the viewport top
+    // its top edge sits (off = 0 when it is flush with the top).
+    function topVisibleAnchor(lv) {
+        var a = { id: "", off: 0 };
+        if (!lv || !lv.contentItem) return a;
+        var best = null, bestY = Infinity;
+        var stack = [lv.contentItem];
+        while (stack.length > 0) {
+            var it = stack.pop();
+            if (it.objectName === "msgBubbleDelegate") {
+                var y = it.mapToItem(lv.contentItem, 0, 0).y;
+                var h = it.height || 1;
+                if (y + h > lv.contentY + 10 && y < bestY && y + h > lv.contentY) {
+                    bestY = y; best = it;
+                }
+            }
+            var kids = it.children || [];
+            for (var i = 0; i < kids.length; i++) stack.push(kids[i]);
+        }
+        if (best) {
+            a.id = best.testMsgId;
+            a.off = Math.max(0, best.mapToItem(lv.contentItem, 0, 0).y - lv.contentY);
+        }
+        return a;
+    }
+
+    // Glue the view to the newest message for a few frames while the layout
+    // settles (delegate heights stream in asynchronously after a swap).
+    // Both settle loops set anchorHold while re-pinning. They exit early once
+    // the position sticks (assigned == observed before assigning) so they
+    // never fight user scrolls longer than necessary.
+    function restoreAtEndSettle(lv) {
+        if (!lv) return;
+        root.scrollRestoreGen++;
+        var gen = root.scrollRestoreGen;
+        var n = 0;
+        var stuck = 0;
+        root.anchorHold = true;
+        var t = Qt.createQmlObject(
+            "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
+            root, "ScrollEndTimer");
+        t.onTriggered.connect(function() {
+            if (gen !== root.scrollRestoreGen || n > 24) { root.anchorHold = false; t.stop(); t.destroy(); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.anchorHold = false; t.stop(); t.destroy(); return; }
+            n++;
+            var before = lv.contentY;
+            lv.positionViewAtEnd();
+            // Position stuck: the assignment no longer changes anything.
+            stuck = (Math.abs(lv.contentY - before) < 0.5) ? stuck + 1 : 0;
+            if (stuck >= 3) { root.anchorHold = false; t.stop(); t.destroy(); }
+        });
+        lv.positionViewAtEnd();
+    }
+
+    // Re-pin the same bubble at the same viewport spot for a few frames;
+    // recomputed every tick so estimate shifts above the anchor are absorbed.
+    // While the anchor delegate is not yet instantiated, bootstrapY is used —
+    // for top-edge prepends pass the anchor's NEW index so the bootstrap can
+    // use positionViewAtIndex (arithmetic on unsettled contentHeight drifts
+    // and can strand the view at the top, re-triggering pagination).
+    function restoreAnchoredSettle(lv, anchor, prevY, bootstrapY, bootstrapIndex) {
+        if (!lv) return;
+        root.scrollRestoreGen++;
+        var gen = root.scrollRestoreGen;
+        var n = 0;
+        var stuck = 0;
+        root.anchorHold = true;
+        var t = Qt.createQmlObject(
+            "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
+            root, "ScrollAnchorTimer");
+        var bootstrap = function() {
+            if (bootstrapIndex !== undefined && bootstrapIndex !== null && bootstrapIndex >= 0) {
+                lv.positionViewAtIndex(bootstrapIndex, ListView.Beginning);
+            } else {
+                lv.contentY = (bootstrapY !== undefined && bootstrapY !== null) ? bootstrapY : prevY;
+            }
+        };
+        t.onTriggered.connect(function() {
+            if (gen !== root.scrollRestoreGen || n > 24) { root.anchorHold = false; t.stop(); t.destroy(); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.anchorHold = false; t.stop(); t.destroy(); return; }
+            n++;
+            var d = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
+            var before = lv.contentY;
+            if (d) {
+                lv.contentY = d.mapToItem(lv.contentItem, 0, 0).y - anchor.off;
+            } else {
+                bootstrap();
+            }
+            // Position stuck: re-pinning no longer changes anything — done.
+            if (Math.abs(lv.contentY - before) < 0.5) stuck++;
+            else stuck = 0;
+            if (stuck >= 3) { root.anchorHold = false; t.stop(); t.destroy(); }
+        });
+        var d0 = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
+        if (d0) lv.contentY = d0.mapToItem(lv.contentItem, 0, 0).y - anchor.off;
+        else bootstrap();
+    }
+
+    function applyMessagesModel(msgs) {
+        var lv = root.getMsgListView();
+        var userAtEnd = lv ? (lv.atYEnd && !lv.draggingVertically && !lv.flickingVertically) : true;
+        var anchor = { id: "", off: 0 };
+        var prevY = 0;
+        if (lv) {
+            prevY = lv.contentY;
+            if (!userAtEnd) anchor = root.topVisibleAnchor(lv);
+        }
+        if (root.testMode) {
+            console.warn("WIDDBG swap: userAtEnd=" + userAtEnd + " atYEnd=" + (lv ? lv.atYEnd : "?") +
+                " prevY=" + prevY + " ch=" + (lv ? Math.round(lv.contentHeight) : "?") +
+                " h=" + (lv ? lv.height : "?") + " anchor=" + anchor.id +
+                " dragging=" + (lv ? lv.draggingVertically : "?") +
+                " flicking=" + (lv ? lv.flickingVertically : "?") +
+                " count=" + msgs.length);
+        }
+        root.swapInFlight = true;
+        root.activeChatMessages = msgs;
+        if (!lv) { root.swapInFlight = false; return; }
+        Qt.callLater(function() {
+            root.swapInFlight = false;
+            if (!lv || root.activeChatMessages !== msgs) return; // a newer merge took over
+            if (userAtEnd) {
+                root.restoreAtEndSettle(lv);
+            } else {
+                root.restoreAnchoredSettle(lv, anchor, prevY);
+            }
+        });
+    }
+
     // ── Top-edge pagination: load 20 older messages on scroll-up ─────────────
     function fetchOlderMessages() {
+        if (root.testMode) console.warn("WIDDBG prepend-run: hasMore=" + root.msgsHasMore +
+            " loading=" + root.msgsLoadingOlder + " inflight=" + root.messagesInFlight +
+            " y=" + (root.getMsgListView() ? Math.round(root.getMsgListView().contentY) : "?"));
         if (!root.isConnected || root.activeChat === null || root.msgsLoadingOlder || !root.msgsHasMore) return;
-        if (root.messagesInFlight) return; // serialize with background polls
+        if (root.messagesInFlight) {
+            // Serialize with background polls — atYBeginningChanged won't
+            // re-fire, so remember to retry once the in-flight fetch lands.
+            root._pendingOlderFetch = root.activeChat.id;
+            return;
+        }
         var msgs = root.activeChatMessages;
         if (msgs.length === 0) return;
+        var lv = root.getMsgListView();
         var oldest = null;
         for (var i = 0; i < msgs.length; i++) {
             if (msgs[i] && msgs[i].id && String(msgs[i].id).indexOf("temp_") !== 0) { oldest = msgs[i]; break; }
@@ -590,6 +826,15 @@ PlasmoidItem {
         if (!oldest) return;
 
         var chatId = root.activeChat.id;
+        // Capture the reading anchor NOW, at fetch start — the view is still
+        // exactly where the user left it. Waiting for the response risks a
+        // drifted view (another merge or settle may have re-pinned in between).
+        var anchor = lv ? root.topVisibleAnchor(lv) : { id: "", off: 0 };
+        var anchorPrevY = lv ? lv.contentY : 0;
+        var anchorIdx = -1;
+        for (var ai = 0; ai < msgs.length; ai++) {
+            if (msgs[ai] && String(msgs[ai].id) === anchor.id) { anchorIdx = ai; break; }
+        }
         root.msgsLoadingOlder = true;
         root.msgsTopError = "";
         root.messagesInFlight = true;
@@ -610,16 +855,29 @@ PlasmoidItem {
                     var older = r.response || [];
                     root.msgsHasMore = (r.hasMore === true);
                     if (older.length === 0) return;
-                    var oldH = (typeof messageListView !== "undefined" && messageListView) ? messageListView.contentHeight : 0;
-                    root.activeChatMessages = PollUtils.prependOlder(root.activeChatMessages, older);
-                    // Keep the visual anchor: shift by the height we added at
-                    // the top so the view doesn't jump.
-                    if (oldH > 0) {
+                    // The model swap resets the ListView; re-pin the bubble the
+                    // user was reading (captured at fetch start) at the same
+                    // viewport spot. Anchor-based, not contentHeight arithmetic
+                    // — contentHeight is partly estimated for delegates that
+                    // are not instantiated, so delta math drifts.
+                    var lv = root.getMsgListView();
+                    var newMsgs = PollUtils.prependOlder(root.activeChatMessages, older);
+                    root.swapInFlight = true; // suppress spurious atYBeginning triggers during the reset
+                    root.activeChatMessages = newMsgs;
+                    // Re-pin the same bubble at the same viewport spot for a
+                    // few frames while heights settle (see restoreAnchoredSettle).
+                    if (lv && anchorIdx >= 0) {
                         Qt.callLater(function() {
-                            if (typeof messageListView !== "undefined" && messageListView) {
-                                messageListView.contentY += messageListView.contentHeight - oldH;
-                            }
+                            root.swapInFlight = false;
+                            if (!lv || lv.model !== newMsgs) return; // a newer merge took over
+                            // Bootstrap via the anchor's NEW index (older.length
+                            // messages landed above it), then the settle loop
+                            // refines to the exact viewport offset.
+                            root.restoreAnchoredSettle(lv, anchor, anchorPrevY, -1,
+                                anchorIdx + older.length);
                         });
+                    } else {
+                        root.swapInFlight = false;
                     }
                 } catch(e) {
                     root.msgsTopError = "Couldn't load older messages";
@@ -744,7 +1002,9 @@ PlasmoidItem {
             }
         }
         if (!found) return;
-        root.activeChatMessages = msgs.slice();
+        // Reassign through the scroll-stable swap: a late thumbnail landing
+        // mid-scroll must not reset the ListView and yank the view.
+        root.applyMessagesModel(msgs.slice());
         if (root.activeChat) {
             var cid = root.activeChat.id;
             var entry = root.msgCache[cid];
@@ -791,7 +1051,6 @@ PlasmoidItem {
         root.mediaList = list;
         root.mediaIndex = startIndex;
         root.viewerVisible = true;
-        root.viewerOpenError = "";
         root.viewerFullFailed = false;
         root.viewerLoadFull();
     }
@@ -800,13 +1059,11 @@ PlasmoidItem {
         root.viewerVisible = false;
         root.viewerFullLoading = false;
         root.viewerFullFailed = false;
-        root.viewerOpenError = "";
     }
 
     function viewerStep(d) {
         if (!root.mediaList || root.mediaList.length === 0) return;
         root.viewerFullFailed = false;
-        root.viewerOpenError = "";
         root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
     }
 
@@ -892,20 +1149,19 @@ PlasmoidItem {
         }
     }
 
-    // Open the current viewer image in the system viewer via
-    // POST /api/openExternally (full-res fetch + xdg-open server-side).
-    // Failures show a brief inline footer error, never silent or fatal.
-    function openExternallyCurrent() {
-        var m = null;
-        if (root.mediaList && root.mediaList.length > 0) {
-            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
-            m = root.mediaList[ci];
-        }
+    // Open a media image in the system viewer via POST /api/openExternally
+    // (full-res fetch + xdg-open server-side). Primary path: tapping an image
+    // bubble (no in-app viewer detour); also used by the viewer toolbar.
+    // Progress/failures surface as a transient toast over the chat, never
+    // silent or fatal.
+    function openExternallyMsg(m) {
         if (!m || !m.id || !root.isConnected || !root.activeChat) {
-            root.viewerOpenError = "Couldn't open image";
-            viewerOpenErrorTimer.restart();
+            root.externalOpenToast = "Couldn't open image";
+            externalOpenToastTimer.restart();
             return;
         }
+        root.externalOpenToast = "Opening in system viewer…";
+        externalOpenToastTimer.stop();
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/openExternally");
         xhr.setRequestHeader("Content-Type",  "application/json");
@@ -913,13 +1169,23 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             if (xhr.status === 200) {
-                root.viewerOpenError = "";
+                root.externalOpenToast = "";
             } else {
-                root.viewerOpenError = "Couldn't open in system viewer";
-                viewerOpenErrorTimer.restart();
+                root.externalOpenToast = "Couldn't open in system viewer";
+                externalOpenToastTimer.restart();
             }
         };
         xhr.send(JSON.stringify({ args: { chatId: root.activeChat.id, msgId: m.id } }));
+    }
+
+    // Viewer toolbar variant: opens whichever image is currently shown.
+    function openExternallyCurrent() {
+        var m = null;
+        if (root.mediaList && root.mediaList.length > 0) {
+            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            m = root.mediaList[ci];
+        }
+        root.openExternallyMsg(m);
     }
 
     function sendMessage(chatId, text) {
@@ -945,12 +1211,13 @@ PlasmoidItem {
             currentMsgs.push(root.activeChatMessages[idx]);
         }
         currentMsgs.push(tempMsg);
-        root.activeChatMessages = currentMsgs;
+        root.applyMessagesModel(currentMsgs);
 
         // Position at the bottom of the messages list
         Qt.callLater(function() {
-            if (typeof messageListView !== "undefined" && messageListView) {
-                messageListView.positionViewAtEnd();
+            var lv = root.getMsgListView();
+            if (lv) {
+                lv.positionViewAtEnd();
             }
         });
 
@@ -1532,10 +1799,15 @@ PlasmoidItem {
 
                     ListView {
                         id: chatListView
+                        objectName: "chatListView"
                         width: parent.width
                         model: root.filteredChats.slice(0, root.chatsShown)
                         spacing: 0
-                        reuseItems: true
+                        // NOTE: deliberately NO reuseItems here (same lesson
+                        // as messageListView below). The model is a JS array
+                        // that is replaced on every refresh, and recycling
+                        // keeps stale bindings — rendering ghosted,
+                        // double-painted titles/timestamps in chat rows.
 
                         // Infinite scroll: grow the window when the user hits
                         // the bottom of the rendered chats.
@@ -1813,6 +2085,8 @@ PlasmoidItem {
 
                     ListView {
                         id: messageListView
+                        objectName: "messageListView"
+                        Component.onCompleted: root.msgListViewRef = messageListView
                         model: root.activeChatMessages
                         spacing: 4
                         clip: true
@@ -1824,17 +2098,29 @@ PlasmoidItem {
                         // overlapping, overflowing bubbles.
 
                         // Always land on the most recent message — but only
-                        // when the user is already at (or near) the bottom, so
-                        // background updates don't yank the scroll position.
+                        // when the user is already at (or near) the bottom AND
+                        // not mid-gesture, so background updates and temp-send
+                        // appends never yank the scroll position ("teleport").
+                        // swapInFlight must be excluded: during a model swap
+                        // contentHeight collapses to ~0, which flips atYEnd
+                        // true spuriously and would yank the view to the end
+                        // right over the anchor restore that follows.
                         onCountChanged: {
-                            if (count > 0 && messageListView.atYEnd) Qt.callLater(messageListView.positionViewAtEnd);
+                            if (count > 0 && atYEnd && !root.swapInFlight &&
+                                !draggingVertically && !flickingVertically)
+                                Qt.callLater(messageListView.positionViewAtEnd);
                         }
                         onWidthChanged: if (count > 0) Qt.callLater(messageListView.positionViewAtEnd);
 
                         // Top-edge lazy loading: fetch 20 older messages when
-                        // the user scrolls to the very top.
+                        // the user scrolls to the very top. swapInFlight and
+                        // anchorHold must be excluded: during a model swap or
+                        // a scroll-restore settle the view can transiently sit
+                        // at contentY≈0, which would chain-load page after page
+                        // on every merge instead of on real user scrolls.
                         onAtYBeginningChanged: {
-                            if (atYBeginning && root.msgsHasMore && !root.msgsLoadingOlder &&
+                            if (atYBeginning && !root.swapInFlight && !root.anchorHold &&
+                                root.msgsHasMore && !root.msgsLoadingOlder &&
                                 root.msgsTopError === "" && contentY < 200 &&
                                 root.activeChatMessages.length > 0) {
                                 root.fetchOlderMessages();
@@ -1903,6 +2189,26 @@ PlasmoidItem {
                             // the reaction button that overflows below the bubble.
                             height: msgBubbleCol.implicitHeight + 16
 
+                            // Media-with-caption plumbing. WhatsApp puts the
+                            // caption text in `body`; a photo/video/sticker
+                            // bubble must render that text BELOW the image
+                            // (previously the caption silently disappeared).
+                            property bool isVisualMedia: modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || !!modelData.thumbUrl || (modelData.body && MsgUtils.isMediaBody(modelData.body))
+                            property string mediaCaption: {
+                                if (!isVisualMedia) return "";
+                                var cap = (typeof modelData.caption === "string" && modelData.caption)
+                                    || modelData.body || "";
+                                if (typeof cap !== "string" || MsgUtils.isMediaBody(cap)) return "";
+                                return cap;
+                            }
+
+                            // Test hooks for the agent test workflow (agent_test.sh).
+                            objectName: "msgBubbleDelegate"
+                            property string testMsgId: String(modelData.id || "")
+                            property bool   testHasCaption: msgCaption.visible && msgCaption.text !== ""
+                            property string testCaptionText: msgCaption.text
+                            property bool   testBodyVisible: msgText.visible
+
                             // Right-click a message -> context menu (Reply / Copy message)
                             MouseArea {
                                 anchors.fill: parent
@@ -1930,8 +2236,14 @@ PlasmoidItem {
                                             var w = msgTime.implicitWidth + 30;
                                             if (msgText.visible) {
                                                 w = Math.max(w, msgText.implicitWidth + 20);
-                                            } else if (msgImage.visible) {
+                                            } else if (msgImage.visible || msgCaption.visible) {
+                                                // Media bubble: at least image
+                                                // width, scaled up to fit the
+                                                // caption text.
                                                 w = Math.max(w, Math.min(messageListView.width * 0.7, 240));
+                                                if (msgCaption.visible) {
+                                                    w = Math.max(w, Math.min(msgCaption.implicitWidth + 20, messageListView.width * 0.7));
+                                                }
                                             }
                                             return Math.min(messageListView.width * 0.75, w);
                                         }
@@ -2012,10 +2324,13 @@ PlasmoidItem {
                                                 }
                                             }
 
-                                            // Message text - with emoji font support
+                                            // Message text - with emoji font support.
+                                            // Hidden for photo/video/sticker bubbles
+                                            // (their caption renders below the image)
+                                            // and when the body IS the media bytes.
                                             Text {
                                                 id: msgText
-                                                visible: !(modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
+                                                visible: !msgDelegateRoot.isVisualMedia && !MsgUtils.isMediaBody(modelData.body)
                                                 text: modelData.body || ""
                                                 color: root.colText
                                                 font.pointSize: 9.5
@@ -2027,12 +2342,10 @@ PlasmoidItem {
 
                                             Image {
                                                 id: msgImage
-                                                visible: (!modelData._thumb || modelData.thumbUrl) && (modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || modelData.thumbUrl || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
+                                                visible: (!modelData._thumb || modelData.thumbUrl) && msgDelegateRoot.isVisualMedia
                                                 source: {
                                                     if (!visible) return "";
-                                                    var s = MsgUtils.mediaSource(modelData);
-                                                    if (s !== "") return s;
-                                                    return modelData.thumbUrl || "";
+                                                    return MsgUtils.mediaPreviewSource(modelData);
                                                 }
                                                 fillMode: Image.PreserveAspectFit
                                                 Layout.maximumWidth: messageListView.width * 0.7
@@ -2049,16 +2362,23 @@ PlasmoidItem {
                                                     if (visible) root.requestThumb(modelData);
                                                 }
 
-                                                // Tap to open the fullscreen viewer.
+                                                // Tap opens the image directly in
+                                                // the system viewer (xdg-open);
+                                                // video keeps the in-app viewer
+                                                // with its "open on phone" note.
                                                 MouseArea {
                                                     anchors.fill: parent
                                                     onClicked: {
-                                                        var list = MsgUtils.buildMediaList(root.activeChatMessages);
-                                                        var idx = -1;
-                                                        for (var i = 0; i < list.length; i++) {
-                                                            if (list[i].id === modelData.id) { idx = i; break; }
+                                                        if (modelData.type === "video") {
+                                                            var list = MsgUtils.buildMediaList(root.activeChatMessages);
+                                                            var idx = -1;
+                                                            for (var i = 0; i < list.length; i++) {
+                                                                if (list[i].id === modelData.id) { idx = i; break; }
+                                                            }
+                                                            root.openMediaViewer(idx);
+                                                            return;
                                                         }
-                                                        root.openMediaViewer(idx);
+                                                        root.openExternallyMsg(modelData);
                                                     }
                                                 }
                                             }
@@ -2072,6 +2392,22 @@ PlasmoidItem {
                                                 font.pointSize: 9
                                                 color: root.colSub
                                                 Layout.maximumWidth: messageListView.width * 0.7
+                                            }
+
+                                            // Caption of a photo/video/sticker,
+                                            // rendered under the media like
+                                            // WhatsApp does. The bubble scales
+                                            // with it (see msgBubble.width).
+                                            PlasmaComponents.Label {
+                                                id: msgCaption
+                                                visible: msgDelegateRoot.mediaCaption !== ""
+                                                text: msgDelegateRoot.mediaCaption
+                                                color: root.colText
+                                                font.pointSize: 9.5
+                                                font.family: root.emojiFont
+                                                wrapMode: Text.Wrap
+                                                Layout.fillWidth: true
+                                                renderType: Text.QtRendering
                                             }
 
                                             PlasmaComponents.Label {
@@ -2673,6 +3009,7 @@ PlasmoidItem {
     // "open on phone" note instead of inline playback.
     Rectangle {
         id: mediaViewer
+        objectName: "mediaViewer"
         anchors.fill: parent
         z: 100
         visible: root.viewerVisible
@@ -2738,9 +3075,7 @@ PlasmoidItem {
                         if (!m) return "";
                         if (root.viewerFullMsgId !== "" && root.viewerFullMsgId === m.id && root.viewerFullSource !== "")
                             return root.viewerFullSource;
-                        var s = MsgUtils.mediaSource(m);
-                        if (s !== "") return s;
-                        return m.thumbUrl || "";
+                        return MsgUtils.mediaPreviewSource(m);
                     }
                     fillMode: Image.PreserveAspectFit
                     scale: viewerStage.vScale
@@ -2840,12 +3175,6 @@ PlasmoidItem {
                             ToolTip.visible: hovered
                             onClicked: root.openExternallyCurrent()
                         }
-                        PlasmaComponents.Label {
-                            visible: root.viewerOpenError !== ""
-                            text: root.viewerOpenError
-                            color: "#ff8a80"
-                            font.pointSize: 8
-                        }
                         Item { Layout.fillWidth: true }
                         PlasmaComponents.ToolButton {
                             icon.name: "go-next"
@@ -2862,12 +3191,6 @@ PlasmoidItem {
                 viewerStage.reset();
                 mediaViewer.forceActiveFocus();
             }
-        }
-
-        Timer {
-            id: viewerOpenErrorTimer
-            interval: 3000
-            onTriggered: root.viewerOpenError = ""
         }
     }
 
@@ -2916,6 +3239,35 @@ PlasmoidItem {
         id: copyToastTimer
         interval: 1200
         onTriggered: root.copyToastVisible = false
+    }
+
+    // External-open status toast ("Opening…" while fetching full-res, error
+    // on failure); clears itself after a short delay so it never lingers.
+    Rectangle {
+        id: externalOpenToastPanel
+        visible: root.externalOpenToast !== ""
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 120
+        width: Math.max(160, toastText.implicitWidth + 32); height: 30; radius: 15
+        color: "#2a363c"
+        border.color: root.colBorder
+        border.width: 1
+        z: 99
+
+        PlasmaComponents.Label {
+            id: toastText
+            anchors.centerIn: parent
+            text: root.externalOpenToast
+            font.pointSize: 8
+            color: root.colText
+        }
+    }
+
+    Timer {
+        id: externalOpenToastTimer
+        interval: 3000
+        onTriggered: root.externalOpenToast = ""
     }
 
     Rectangle {
