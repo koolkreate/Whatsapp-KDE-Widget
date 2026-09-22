@@ -219,6 +219,26 @@ async function getMediaInPage(opts) {
         return { error: 'DOWNLOAD_FAILED:crypto:' + String((e && e.message) || e) };
     }
 
+    // Audio (incl. voice notes): no bitmap step — ship the raw bytes as a
+    // data URL. Canvas decode would fail on non-image payloads.
+    if (mtype === 'audio' || mtype === 'ptt') {
+        try {
+            var mime = 'audio/ogg';
+            try {
+                var mt = String(msg.mimetype || '');
+                if (mt.indexOf('audio/') === 0) mime = mt.split(';')[0];
+            } catch (_) { }
+            var bin = '';
+            var chunk = 0x8000;
+            for (var b = 0; b < plainBuf.length; b += chunk) {
+                bin += String.fromCharCode.apply(null, plainBuf.subarray(b, b + chunk));
+            }
+            return { dataUrl: 'data:' + mime + ';base64,' + btoa(bin), width: 0, height: 0 };
+        } catch (e) {
+            return { error: 'DOWNLOAD_FAILED:encode:' + String((e && e.message) || e) };
+        }
+    }
+
     // Decode, downscale on canvas (longest edge capped at maxEdge), jpeg out.
     var bmp = null;
     try {

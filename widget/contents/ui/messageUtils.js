@@ -11,7 +11,7 @@ function isMediaMessage(msg) {
     if (!msg) return false;
     var type = msg.type || '';
     if (type === 'image' || type === 'video' || type === 'audio' ||
-        type === 'document' || type === 'sticker') return true;
+        type === 'ptt' || type === 'document' || type === 'sticker') return true;
     return isMediaBody(msg.body);
 }
 
@@ -40,6 +40,7 @@ function mediaLabel(type) {
         case 'image':    return '📷 Photo';
         case 'video':    return '🎥 Video';
         case 'audio':    return '🎵 Audio';
+        case 'ptt':      return '🎵 Voice note';
         case 'document': return '📄 Document';
         case 'sticker':  return '🪄 Sticker';
         case 'location': return '📍 Location';
@@ -236,12 +237,37 @@ function compareChats(a, b, isPinned) {
     return 0;
 }
 
+// Voice notes and audio attachments (WhatsApp marks voice notes `ptt`).
+function isAudioMessage(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    var type = msg.type || '';
+    return type === 'audio' || type === 'ptt';
+}
+
+// Duration seconds for an audio message: explicit duration field first,
+// else 0 (unknown — the bubble shows the player's live duration instead).
+function audioDuration(msg) {
+    if (!msg || typeof msg !== 'object') return 0;
+    var d = Number(msg.duration);
+    if (isFinite(d) && d > 0) return Math.floor(d);
+    return 0;
+}
+
+function formatDuration(totalSecs) {
+    var s = Math.max(0, Math.floor(Number(totalSecs) || 0));
+    var m = Math.floor(s / 60);
+    return m + ':' + (s % 60 < 10 ? '0' : '') + (s % 60);
+}
+
 // Node export (ignored by QML, where `module` is undefined).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         isMediaBody: isMediaBody,
         mediaCaption: mediaCaption,
         isMediaMessage: isMediaMessage,
+        isAudioMessage: isAudioMessage,
+        audioDuration: audioDuration,
+        formatDuration: formatDuration,
         mediaLabel: mediaLabel,
         copyTextForMessage: copyTextForMessage,
         replyPreviewText: replyPreviewText,

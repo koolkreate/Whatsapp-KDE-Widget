@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Effects
 import QtQuick.Controls
+import QtMultimedia
+import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components 3.0 as PlasmaComponents
 import QtQuick.Dialogs
@@ -177,6 +179,7 @@ PlasmoidItem {
     onActiveChatChanged: {
         root.clearPendingReply();
         root.clearPendingAttachment();
+        root.scrollRestoreGen++;
         root.lastMsgSig = "";
         root.pollStreak = 0;
         root.pollsSinceFull = 0;
@@ -656,6 +659,8 @@ PlasmoidItem {
     property bool swapInFlight: false
     property int  scrollRestoreGen: 0   // supersedes in-flight scroll-restore loops
     property bool anchorHold: false     // a scroll-restore settle is re-pinning the view
+    property string restoreMode: ""     // "end" | "anchor" | "" (no settle running)
+    property string restoreChat: ""     // chat id the running settle serves
     property string _pendingOlderFetch: "" // older-page fetch queued behind an in-flight poll
 
     // Locate an instantiated message-bubble delegate by message id.
@@ -673,6 +678,22 @@ PlasmoidItem {
     function findBubbleDelegate(lv, msgId) {
         if (!lv || !lv.contentItem) return null;
         return findBubbleDelegateIn(lv.contentItem, msgId);
+    }
+
+    // Computed viewport edges. atYEnd/atYBeginning can latch stale
+    // values while contentHeight is still growing (async delegate
+    // heights), so arrival decisions use live numbers instead.
+    function isAtEnd(lv) {
+        if (!lv) return true;
+        try {
+            return lv.contentY >= lv.contentHeight - lv.height - 2;
+        } catch (e) { return true; }
+    }
+    function isAtBeginning(lv) {
+        if (!lv) return false;
+        try {
+            return lv.contentY <= 2;
+        } catch (e) { return false; }
     }
 
     // {id, off}: topmost visible bubble and how far below the viewport top
@@ -706,27 +727,87 @@ PlasmoidItem {
     // Both settle loops set anchorHold while re-pinning. They exit early once
     // the position sticks (assigned == observed before assigning) so they
     // never fight user scrolls longer than necessary.
-    function restoreAtEndSettle(lv) {
+    function releaseRestore(t) {
+        root.anchorHold = false;
+        root.restoreMode = "";
+        root.restoreChat = "";
+        try { t.stop(); } catch (e) {}
+        try { t.destroy(); } catch (e) {}
+        Qt.callLater(function() {
+            if (!root._pendingOlderFetch || !root.activeChat ||
+                root.activeChat.id !== root._pendingOlderFetch) {
+                root._pendingOlderFetch = "";
+                return;
+            }
+            var lv = root.getMsgListView();
+            if (!lv || !root.isAtBeginning(lv) || !root.msgsHasMore ||
+                root.msgsLoadingOlder || root.messagesInFlight || root.anchorHold) {
+                if (!lv || !root.isAtBeginning(lv)) root._pendingOlderFetch = "";
+                return;
+            }
+            root._pendingOlderFetch = "";
+            root.fetchOlderMessages();
+        });
+    }
+    function restoreAtEndSettle(lv, retries) {
         if (!lv) return;
+        retries = retries || 0;
         root.scrollRestoreGen++;
         var gen = root.scrollRestoreGen;
-        var n = 0;
-        var stuck = 0;
+        var idle = 0;
+        var total = 0;
+        var lastH = -1;
         root.anchorHold = true;
+        root.restoreMode = "end";
+        root.restoreChat = root.activeChat ? String(root.activeChat.id) : "";
         var t = Qt.createQmlObject(
             "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
             root, "ScrollEndTimer");
+        var retryLater = function() {
+            if (retries >= 4) return;
+            var rt = Qt.createQmlObject(
+                "import QtQuick; Timer { interval: 300; repeat: false; running: true }",
+                root, "ScrollEndRetryTimer");
+            rt.onTriggered.connect(function() {
+                try { rt.destroy(); } catch (e) {}
+                if (root.anchorHold || root.restoreMode !== "") return;
+                var ll = root.getMsgListView();
+                if (!ll) return;
+                if (root.isAtEnd(ll) && ll.contentHeight > ll.height) return;
+                if (ll.draggingVertically || ll.flickingVertically) return;
+                root.restoreAtEndSettle(ll, retries + 1);
+            });
+        };
         t.onTriggered.connect(function() {
-            if (gen !== root.scrollRestoreGen || n > 24) { root.anchorHold = false; t.stop(); t.destroy(); return; }
-            if (lv.draggingVertically || lv.flickingVertically) { root.anchorHold = false; t.stop(); t.destroy(); return; }
-            n++;
+            if (gen !== root.scrollRestoreGen) { root.releaseRestore(t); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.releaseRestore(t); return; }
+            total++;
+            if (total > 240) { root.releaseRestore(t); return; }
+            // Drive with a direct clamped assignment, not
+            // positionViewAtEnd(): issued in the same frame as a model
+            // reset, the method call can be swallowed while the ListView
+            // is still processing the new model.
+            var hNow = lv.contentHeight;
+            if (hNow <= 0) return;
+            var target = Math.max(0, hNow - lv.height);
             var before = lv.contentY;
-            lv.positionViewAtEnd();
-            // Position stuck: the assignment no longer changes anything.
-            stuck = (Math.abs(lv.contentY - before) < 0.5) ? stuck + 1 : 0;
-            if (stuck >= 3) { root.anchorHold = false; t.stop(); t.destroy(); }
+            if (Math.abs(target - before) >= 0.5) lv.contentY = target;
+            // Exit only on genuine stillness: any height shift or real
+            // movement resets the idle count, so slow layouts keep
+            // converging instead of timing out mid-stream.
+            if (hNow !== lastH) { lastH = hNow; idle = 0; }
+            else if ((root.isAtEnd(lv) && hNow > lv.height) || Math.abs(lv.contentY - before) < 0.5) idle++;
+            else idle = 0;
+            if (idle >= 3) {
+                var arrived = root.isAtEnd(lv) && hNow > lv.height;
+                var short = hNow <= lv.height;
+                root.releaseRestore(t);
+                if (!arrived && !short) retryLater();
+            }
         });
-        lv.positionViewAtEnd();
+        if (lv.contentHeight > 0) {
+            lv.contentY = Math.max(0, lv.contentHeight - lv.height);
+        }
     }
 
     // Re-pin the same bubble at the same viewport spot for a few frames;
@@ -742,40 +823,43 @@ PlasmoidItem {
         var n = 0;
         var stuck = 0;
         root.anchorHold = true;
+        root.restoreMode = "anchor";
+        root.restoreChat = root.activeChat ? String(root.activeChat.id) : "";
         var t = Qt.createQmlObject(
             "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
             root, "ScrollAnchorTimer");
+        var pinY = function(y) { return Math.max(0, y); };
         var bootstrap = function() {
             if (bootstrapIndex !== undefined && bootstrapIndex !== null && bootstrapIndex >= 0) {
                 lv.positionViewAtIndex(bootstrapIndex, ListView.Beginning);
             } else {
-                lv.contentY = (bootstrapY !== undefined && bootstrapY !== null) ? bootstrapY : prevY;
+                lv.contentY = pinY((bootstrapY !== undefined && bootstrapY !== null) ? bootstrapY : prevY);
             }
         };
         t.onTriggered.connect(function() {
-            if (gen !== root.scrollRestoreGen || n > 24) { root.anchorHold = false; t.stop(); t.destroy(); return; }
-            if (lv.draggingVertically || lv.flickingVertically) { root.anchorHold = false; t.stop(); t.destroy(); return; }
+            if (gen !== root.scrollRestoreGen || n > 24) { root.releaseRestore(t); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.releaseRestore(t); return; }
             n++;
             var d = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
             var before = lv.contentY;
             if (d) {
-                lv.contentY = d.mapToItem(lv.contentItem, 0, 0).y - anchor.off;
+                lv.contentY = pinY(d.mapToItem(lv.contentItem, 0, 0).y - anchor.off);
             } else {
                 bootstrap();
             }
             // Position stuck: re-pinning no longer changes anything — done.
             if (Math.abs(lv.contentY - before) < 0.5) stuck++;
             else stuck = 0;
-            if (stuck >= 3) { root.anchorHold = false; t.stop(); t.destroy(); }
+            if (stuck >= 3) { root.releaseRestore(t); }
         });
         var d0 = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
-        if (d0) lv.contentY = d0.mapToItem(lv.contentItem, 0, 0).y - anchor.off;
+        if (d0) lv.contentY = pinY(d0.mapToItem(lv.contentItem, 0, 0).y - anchor.off);
         else bootstrap();
     }
 
     function applyMessagesModel(msgs) {
         var lv = root.getMsgListView();
-        var userAtEnd = lv ? (lv.atYEnd && !lv.draggingVertically && !lv.flickingVertically) : true;
+        var userAtEnd = lv ? (root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically) : true;
         var anchor = { id: "", off: 0 };
         var prevY = 0;
         if (lv) {
@@ -796,6 +880,20 @@ PlasmoidItem {
         Qt.callLater(function() {
             root.swapInFlight = false;
             if (!lv || root.activeChatMessages !== msgs) return; // a newer merge took over
+            if (root.anchorHold && root.restoreMode !== "") {
+                var liveChat = root.activeChat ? String(root.activeChat.id) : "";
+                if (liveChat !== "" && liveChat === root.restoreChat) {
+                    return;
+                }
+                root.scrollRestoreGen++;
+                var liveAtEnd = root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically;
+                if (liveAtEnd) {
+                    root.restoreAtEndSettle(lv);
+                } else {
+                    root.restoreAnchoredSettle(lv, root.topVisibleAnchor(lv), lv.contentY);
+                }
+                return;
+            }
             if (userAtEnd) {
                 root.restoreAtEndSettle(lv);
             } else {
@@ -810,9 +908,11 @@ PlasmoidItem {
             " loading=" + root.msgsLoadingOlder + " inflight=" + root.messagesInFlight +
             " y=" + (root.getMsgListView() ? Math.round(root.getMsgListView().contentY) : "?"));
         if (!root.isConnected || root.activeChat === null || root.msgsLoadingOlder || !root.msgsHasMore) return;
-        if (root.messagesInFlight) {
-            // Serialize with background polls — atYBeginningChanged won't
-            // re-fire, so remember to retry once the in-flight fetch lands.
+        if (root.messagesInFlight || root.anchorHold) {
+            // Serialize with background polls AND with running scroll
+            // restores: starting a second fetch while a restore is still
+            // re-pinning captures its anchor mid-churn and strands the
+            // view. Remember to retry once things settle.
             root._pendingOlderFetch = root.activeChat.id;
             return;
         }
@@ -831,10 +931,6 @@ PlasmoidItem {
         // drifted view (another merge or settle may have re-pinned in between).
         var anchor = lv ? root.topVisibleAnchor(lv) : { id: "", off: 0 };
         var anchorPrevY = lv ? lv.contentY : 0;
-        var anchorIdx = -1;
-        for (var ai = 0; ai < msgs.length; ai++) {
-            if (msgs[ai] && String(msgs[ai].id) === anchor.id) { anchorIdx = ai; break; }
-        }
         root.msgsLoadingOlder = true;
         root.msgsTopError = "";
         root.messagesInFlight = true;
@@ -866,16 +962,34 @@ PlasmoidItem {
                     root.activeChatMessages = newMsgs;
                     // Re-pin the same bubble at the same viewport spot for a
                     // few frames while heights settle (see restoreAnchoredSettle).
-                    if (lv && anchorIdx >= 0) {
-                        Qt.callLater(function() {
-                            root.swapInFlight = false;
-                            if (!lv || lv.model !== newMsgs) return; // a newer merge took over
-                            // Bootstrap via the anchor's NEW index (older.length
-                            // messages landed above it), then the settle loop
-                            // refines to the exact viewport offset.
-                            root.restoreAnchoredSettle(lv, anchor, anchorPrevY, -1,
-                                anchorIdx + older.length);
-                        });
+                    // Resolve the anchor to a message id up front; at run time
+                    // rebase it onto whatever model is live. A concurrent merge
+                    // (thumb landing, background poll) may replace the array
+                    // between response and layout — abandoning the restore
+                    // then strands the view wherever the reset dropped it.
+                    // With no identifiable anchor, fall back to the first
+                    // pre-existing item (it sits at older.length).
+                    var rebaseId = anchor.id;
+                    var rebaseOff = anchor.off || 0;
+                    if (!rebaseId && newMsgs.length > older.length) {
+                        var firstOld = newMsgs[older.length];
+                        if (firstOld && firstOld.id) rebaseId = String(firstOld.id);
+                    }
+                    if (lv && rebaseId) {
+                        (function(lvRef, wantId, wantOff) {
+                            Qt.callLater(function() {
+                                root.swapInFlight = false;
+                                if (!lvRef) return;
+                                var cur = root.activeChatMessages || [];
+                                var nk = -1;
+                                for (var i = 0; i < cur.length; i++) {
+                                    if (cur[i] && String(cur[i].id) === wantId) { nk = i; break; }
+                                }
+                                if (nk < 0) return; // anchor genuinely gone
+                                root.restoreAnchoredSettle(lvRef,
+                                    { id: wantId, off: wantOff }, anchorPrevY, -1, nk);
+                            });
+                        })(lv, rebaseId, rebaseOff);
                     } else {
                         root.swapInFlight = false;
                     }
@@ -1042,6 +1156,277 @@ PlasmoidItem {
             }
         }
         return merged;
+    }
+
+    // ── Voice-note / audio playback ────────────────────────────────────────
+    // One shared player for the whole widget: starting a second bubble
+    // stops the first, and bubble UI binds to root.audio* state.
+    property string audioPlayingMsgId: ""
+    property string audioPendingMsgId: ""
+    property string audioErrorMsgId: ""
+    property string audioError: ""
+    property bool audioIsPlaying: false
+    property int audioPositionMs: 0
+    property real audioSpeed: 1.0
+
+    MediaPlayer {
+        id: audioPlayer
+        audioOutput: AudioOutput { }
+        onPlaybackStateChanged: {
+            root.audioIsPlaying = (playbackState === MediaPlayer.PlayingState);
+            if (playbackState === MediaPlayer.StoppedState) root.audioPositionMs = 0;
+        }
+        onPositionChanged: { root.audioPositionMs = position; }
+        onErrorOccurred: function(error, errorString) {
+            root.audioError = errorString || "Couldn't play audio";
+            root.audioErrorMsgId = root.audioPlayingMsgId;
+            root.audioPlayingMsgId = "";
+            root.audioIsPlaying = false;
+            root.audioPendingMsgId = "";
+            audioErrorTimer.restart();
+        }
+    }
+
+    Timer {
+        id: audioErrorTimer
+        interval: 2500
+        repeat: false
+        running: false
+        onTriggered: { root.audioError = ""; root.audioErrorMsgId = ""; }
+    }
+
+    function audioSpeedLabel() {
+        if (root.audioSpeed >= 2.0) return "2x";
+        if (root.audioSpeed >= 1.5) return "1.5x";
+        return "1x";
+    }
+
+    function cycleAudioSpeed() {
+        if (root.audioSpeed >= 2.0) root.audioSpeed = 1.0;
+        else if (root.audioSpeed >= 1.5) root.audioSpeed = 2.0;
+        else root.audioSpeed = 1.5;
+        audioPlayer.playbackRate = root.audioSpeed;
+    }
+
+    // Fetch full audio bytes once, then write the dataUrl back onto the
+    // live message (+ MRU copy) so revalidations never refetch it.
+    function requestAudio(msg) {
+        if (!msg || msg.fullUrl) return;
+        if (!MsgUtils.isAudioMessage(msg)) return;
+        if (!root.activeChat || !msg.id) return;
+        var chatId = root.activeChat.id;
+        var mid = msg.id;
+        root.fetchMedia(chatId, mid, 0, function(url) {
+            if (!url) {
+                if (String(root.audioPendingMsgId) === String(mid)) {
+                    root.audioPendingMsgId = "";
+                    root.audioError = "Couldn't load audio";
+                    root.audioErrorMsgId = mid;
+                    audioErrorTimer.restart();
+                }
+                return;
+            }
+            root.applyFullUrl(mid, url);
+            if (String(root.audioPendingMsgId) === String(mid)) {
+                root.audioPendingMsgId = "";
+                audioPlayer.source = url;
+                audioPlayer.playbackRate = root.audioSpeed;
+                audioPlayer.play();
+            }
+        });
+    }
+
+    function applyFullUrl(msgId, dataUrl) {
+        if (!msgId || !dataUrl) return;
+        var found = false;
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === String(msgId)) {
+                msgs[i].fullUrl = dataUrl;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+        root.applyMessagesModel(msgs.slice());
+        if (root.activeChat) {
+            var cid = root.activeChat.id;
+            var entry = root.msgCache[cid];
+            if (entry && entry.messages) {
+                for (var j = 0; j < entry.messages.length; j++) {
+                    if (entry.messages[j] && String(entry.messages[j].id) === String(msgId)) {
+                        entry.messages[j].fullUrl = dataUrl;
+                        break;
+                    }
+                }
+                var next = {};
+                for (var k in root.msgCache) next[k] = root.msgCache[k];
+                root.msgCache = next;
+            }
+        }
+    }
+
+    function toggleAudioPlayback(msg) {
+        if (!msg || !msg.id) return;
+        var mid = msg.id;
+        if (String(root.audioPlayingMsgId) === String(mid) && root.audioIsPlaying) {
+            audioPlayer.pause();
+            return;
+        }
+        if (String(root.audioPlayingMsgId) === String(mid) && !root.audioIsPlaying) {
+            var resumeSrc = msg.fullUrl || "";
+            if (resumeSrc && String(audioPlayer.source) !== "") {
+                audioPlayer.playbackRate = root.audioSpeed;
+                audioPlayer.play();
+                return;
+            }
+        }
+        root.audioPlayingMsgId = mid;
+        root.audioPositionMs = 0;
+        root.audioError = "";
+        root.audioErrorMsgId = "";
+        var src = msg.fullUrl || "";
+        if (src) {
+            audioPlayer.source = src;
+            audioPlayer.playbackRate = root.audioSpeed;
+            audioPlayer.play();
+        } else {
+            root.audioPendingMsgId = mid;
+            audioPlayer.stop();
+            root.requestAudio(msg);
+        }
+    }
+
+    function stopAudio() {
+        audioPlayer.stop();
+        root.audioPlayingMsgId = "";
+        root.audioPositionMs = 0;
+        root.audioPendingMsgId = "";
+    }
+
+    function seekAudioFraction(frac, msgId) {
+        if (String(root.audioPlayingMsgId) !== String(msgId)) return;
+        var d = audioPlayer.duration || 0;
+        if (d <= 0) return;
+        var f = Math.min(1, Math.max(0, frac));
+        audioPlayer.position = Math.floor(f * d);
+    }
+
+    // ── Voice-note recording ───────────────────────────────────────────────
+    // Toggle flow, laptop-first: tap mic to record, tap again to stop into
+    // a draft (play / discard / send). Drafts send through the same
+    // sendFile path as pasted images, so the backend needs no new endpoint.
+    property string voiceState: ""
+    property string voicePath: ""
+    property int voiceSecs: 0
+    property string voiceError: ""
+
+    CaptureSession {
+        id: voiceCapture
+        audioInput: AudioInput { id: voiceMic }
+        recorder: MediaRecorder {
+            id: voiceRecorder
+            onErrorOccurred: function(error, errorString) {
+                root.voiceError = errorString || "Microphone unavailable";
+                root.voiceState = "";
+                root.voiceSecs = 0;
+                voiceRecTimer.stop();
+                voiceErrorTimer.restart();
+            }
+        }
+    }
+
+    Timer {
+        id: voiceRecTimer
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: {
+            root.voiceSecs++;
+            recDot.opacity = recDot.opacity > 0.5 ? 0.25 : 1.0;
+        }
+    }
+
+    Timer {
+        id: voiceErrorTimer
+        interval: 3000
+        repeat: false
+        running: false
+        onTriggered: root.voiceError = ""
+    }
+
+    function voiceDraftUrl() {
+        if (!root.voicePath) return "";
+        var p = String(root.voicePath);
+        return p.indexOf("file://") === 0 ? p : "file://" + p;
+    }
+
+    function startVoiceNote() {
+        if (root.voiceState === "recording" || !root.activeChat) return;
+        root.stopAudio();
+        var dir = "";
+        try { dir = StandardPaths.writableLocation(StandardPaths.TempLocation); } catch (e) {}
+        if (!dir) dir = "/tmp";
+        var plain = String(dir).replace(/\/$/, "") + "/wa-voicenote-" + Date.now() + ".ogg";
+        root.voicePath = plain;
+        root.voiceSecs = 0;
+        root.voiceError = "";
+        try {
+            voiceRecorder.outputLocation = "file://" + plain;
+            voiceRecorder.record();
+        } catch (e) {
+            root.voiceError = "Microphone unavailable";
+            root.voicePath = "";
+            voiceErrorTimer.restart();
+            return;
+        }
+        root.voiceState = "recording";
+        voiceRecTimer.start();
+    }
+
+    function stopVoiceNote() {
+        if (root.voiceState !== "recording") return;
+        try { voiceRecorder.stop(); } catch (e) {}
+        voiceRecTimer.stop();
+        try {
+            var actual = String(voiceRecorder.actualLocation || "");
+            if (actual) root.voicePath = actual.replace(/^file:\/\//, "");
+        } catch (e) {}
+        root.voiceState = root.voicePath ? "draft" : "";
+    }
+
+    function toggleVoiceNote() {
+        if (root.voiceState === "recording") root.stopVoiceNote();
+        else if (root.voiceState === "") root.startVoiceNote();
+    }
+
+    function discardVoiceNote() {
+        try { voiceRecorder.stop(); } catch (e) {}
+        voiceRecTimer.stop();
+        if (String(root.audioPlayingMsgId) === "__draft__") root.stopAudio();
+        root.voiceState = "";
+        root.voicePath = "";
+        root.voiceSecs = 0;
+    }
+
+    function playVoiceDraft() {
+        if (!root.voicePath) return;
+        if (String(root.audioPlayingMsgId) === "__draft__" && root.audioIsPlaying) {
+            audioPlayer.pause();
+            return;
+        }
+        root.toggleAudioPlayback({ id: "__draft__", fullUrl: root.voiceDraftUrl() });
+    }
+
+    function sendVoiceNote() {
+        if (!root.activeChat || !root.voicePath || root.sendInFlight) return;
+        var path = String(root.voicePath);
+        var chatId = root.activeChat.id;
+        if (String(root.audioPlayingMsgId) === "__draft__") root.stopAudio();
+        root.voiceState = "";
+        root.voicePath = "";
+        root.voiceSecs = 0;
+        root.sendFile(chatId, path, "");
     }
 
     // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
@@ -1791,17 +2176,17 @@ PlasmoidItem {
                 // ── Separator ──────────────────────────────────
                 Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
-                // ── Chat list ──────────────────────────────────
-                PlasmaComponents.ScrollView {
+                // ── Chat list: bare ListView with an attached scrollbar,
+                // same reason as the message history below — the ListView
+                // itself must own contentY/atYEnd.
+                ListView {
+                    id: chatListView
+                    objectName: "chatListView"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-
-                    ListView {
-                        id: chatListView
-                        objectName: "chatListView"
-                        width: parent.width
-                        model: root.filteredChats.slice(0, root.chatsShown)
+                    ScrollBar.vertical: ScrollBar { }
+                    model: root.filteredChats.slice(0, root.chatsShown)
                         spacing: 0
                         // NOTE: deliberately NO reuseItems here (same lesson
                         // as messageListView below). The model is a JS array
@@ -1982,7 +2367,6 @@ PlasmoidItem {
                                 opacity: 0.5
                             }
                         }
-                    }
                 }
             }
 
@@ -2076,17 +2460,17 @@ PlasmoidItem {
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
-                // ── Message History ────────────────────────────
-                PlasmaComponents.ScrollView {
-                    id: messageScroll
+                // ── Message History: bare ListView with an attached
+                // scrollbar. A ListView nested in a ScrollView fights it
+                // for scrolling (stale contentY, dead atYEnd), so the
+                // ListView itself is the scroller here.
+                ListView {
+                    id: messageListView
+                    objectName: "messageListView"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    clip: true
-
-                    ListView {
-                        id: messageListView
-                        objectName: "messageListView"
-                        Component.onCompleted: root.msgListViewRef = messageListView
+                    ScrollBar.vertical: ScrollBar { }
+                    Component.onCompleted: root.msgListViewRef = messageListView
                         model: root.activeChatMessages
                         spacing: 4
                         clip: true
@@ -2106,7 +2490,7 @@ PlasmoidItem {
                         // true spuriously and would yank the view to the end
                         // right over the anchor restore that follows.
                         onCountChanged: {
-                            if (count > 0 && atYEnd && !root.swapInFlight &&
+                            if (count > 0 && root.isAtEnd(messageListView) && !root.swapInFlight &&
                                 !draggingVertically && !flickingVertically)
                                 Qt.callLater(messageListView.positionViewAtEnd);
                         }
@@ -2119,7 +2503,7 @@ PlasmoidItem {
                         // at contentY≈0, which would chain-load page after page
                         // on every merge instead of on real user scrolls.
                         onAtYBeginningChanged: {
-                            if (atYBeginning && !root.swapInFlight && !root.anchorHold &&
+                            if (atYBeginning && root.isAtBeginning(messageListView) && !root.swapInFlight && !root.anchorHold &&
                                 root.msgsHasMore && !root.msgsLoadingOlder &&
                                 root.msgsTopError === "" && contentY < 200 &&
                                 root.activeChatMessages.length > 0) {
@@ -2208,6 +2592,9 @@ PlasmoidItem {
                             property bool   testHasCaption: msgCaption.visible && msgCaption.text !== ""
                             property string testCaptionText: msgCaption.text
                             property bool   testBodyVisible: msgText.visible
+                            property bool   testHasAudio: msgAudio.visible
+                            property string testAudioDuration: audioTimeLabel.text
+                            property int    testWaveBars: waveRow.barCount
 
                             // Right-click a message -> context menu (Reply / Copy message)
                             MouseArea {
@@ -2236,6 +2623,8 @@ PlasmoidItem {
                                             var w = msgTime.implicitWidth + 30;
                                             if (msgText.visible) {
                                                 w = Math.max(w, msgText.implicitWidth + 20);
+                                            } else if (msgAudio.visible) {
+                                                w = Math.max(w, Math.min(messageListView.width * 0.7, 250));
                                             } else if (msgImage.visible || msgCaption.visible) {
                                                 // Media bubble: at least image
                                                 // width, scaled up to fit the
@@ -2330,7 +2719,7 @@ PlasmoidItem {
                                             // and when the body IS the media bytes.
                                             Text {
                                                 id: msgText
-                                                visible: !msgDelegateRoot.isVisualMedia && !MsgUtils.isMediaBody(modelData.body)
+                                                visible: !msgDelegateRoot.isVisualMedia && !MsgUtils.isMediaBody(modelData.body) && !MsgUtils.isAudioMessage(modelData)
                                                 text: modelData.body || ""
                                                 color: root.colText
                                                 font.pointSize: 9.5
@@ -2392,6 +2781,132 @@ PlasmoidItem {
                                                 font.pointSize: 9
                                                 color: root.colSub
                                                 Layout.maximumWidth: messageListView.width * 0.7
+                                            }
+
+                                            // Voice note / audio message. The
+                                            // Repeater aliases modelData (its
+                                            // own modelData is the bar index),
+                                            // so everything inside reads audioMsg.
+                                            ColumnLayout {
+                                                id: msgAudio
+                                                property var audioMsg: modelData
+                                                visible: MsgUtils.isAudioMessage(modelData)
+                                                Layout.fillWidth: true
+                                                Layout.maximumWidth: messageListView.width * 0.7
+                                                spacing: 4
+
+                                                Component.onCompleted: { if (visible) root.requestAudio(audioMsg); }
+                                                onVisibleChanged: { if (visible) root.requestAudio(audioMsg); }
+
+                                                RowLayout {
+                                                    spacing: 8
+                                                    Layout.fillWidth: true
+
+                                                    Rectangle {
+                                                        width: 36; height: 36; radius: 18
+                                                        color: root.colAccent
+                                                        Text {
+                                                            anchors.centerIn: parent
+                                                            text: String(root.audioPlayingMsgId) === String(msgAudio.audioMsg.id) && root.audioIsPlaying ? "❚❚" : "▶"
+                                                            color: "#ffffff"
+                                                            font.pointSize: 12
+                                                        }
+                                                        MouseArea {
+                                                            anchors.fill: parent
+                                                            onClicked: root.toggleAudioPlayback(msgAudio.audioMsg)
+                                                        }
+                                                    }
+
+                                                    ColumnLayout {
+                                                        Layout.fillWidth: true
+                                                        spacing: 2
+
+                                                        Item {
+                                                            id: waveRow
+                                                            Layout.fillWidth: true
+                                                            Layout.preferredHeight: 30
+                                                            property int barCount: (msgAudio.audioMsg.waveform && msgAudio.audioMsg.waveform.length) || 0
+                                                            property real playedFrac: {
+                                                                if (String(root.audioPlayingMsgId) !== String(msgAudio.audioMsg.id)) return 0;
+                                                                var d = audioPlayer.duration || 0;
+                                                                if (d <= 0) return 0;
+                                                                return Math.min(1, Math.max(0, root.audioPositionMs / d));
+                                                            }
+                                                            Row {
+                                                                anchors.fill: parent
+                                                                spacing: 1
+                                                                Repeater {
+                                                                    model: waveRow.barCount
+                                                                    Rectangle {
+                                                                        width: Math.max(1, (waveRow.width - Math.max(0, waveRow.barCount - 1)) / Math.max(1, waveRow.barCount))
+                                                                        height: {
+                                                                            var v = (msgAudio.audioMsg.waveform && msgAudio.audioMsg.waveform[index]) || 0;
+                                                                            return 4 + (Math.min(100, Math.max(0, v)) / 100) * (waveRow.height - 4);
+                                                                        }
+                                                                        y: (waveRow.height - height) / 2
+                                                                        color: (index / Math.max(1, waveRow.barCount)) < waveRow.playedFrac ? root.colAccent : root.colSub
+                                                                    }
+                                                                }
+                                                            }
+                                                            MouseArea {
+                                                                anchors.fill: parent
+                                                                onClicked: function(mouse) {
+                                                                    if (waveRow.width > 0) root.seekAudioFraction(mouse.x / waveRow.width, msgAudio.audioMsg.id);
+                                                                }
+                                                                onPositionChanged: function(mouse) {
+                                                                    if (pressed && waveRow.width > 0) root.seekAudioFraction(mouse.x / waveRow.width, msgAudio.audioMsg.id);
+                                                                }
+                                                            }
+                                                        }
+
+                                                        RowLayout {
+                                                            spacing: 6
+                                                            PlasmaComponents.Label {
+                                                                id: audioTimeLabel
+                                                                text: {
+                                                                    var total = MsgUtils.audioDuration(msgAudio.audioMsg);
+                                                                    if (String(root.audioPlayingMsgId) === String(msgAudio.audioMsg.id)) {
+                                                                        if (total <= 0 && audioPlayer.duration > 0) total = Math.round(audioPlayer.duration / 1000);
+                                                                        var pos = Math.floor(root.audioPositionMs / 1000);
+                                                                        if (root.audioIsPlaying || pos > 0) return MsgUtils.formatDuration(pos) + " / " + MsgUtils.formatDuration(total);
+                                                                    }
+                                                                    return MsgUtils.formatDuration(total);
+                                                                }
+                                                                font.pointSize: 7.5
+                                                                color: root.colSub
+                                                            }
+                                                            Item { Layout.fillWidth: true; width: 1 }
+                                                            PlasmaComponents.Label {
+                                                                text: root.audioSpeedLabel()
+                                                                font.pointSize: 7.5
+                                                                font.bold: true
+                                                                color: root.colAccent
+                                                                MouseArea {
+                                                                    anchors.fill: parent
+                                                                    onClicked: root.cycleAudioSpeed()
+                                                                }
+                                                            }
+                                                            PlasmaComponents.Label {
+                                                                text: "⧉"
+                                                                font.pointSize: 9
+                                                                color: root.colSub
+                                                                MouseArea {
+                                                                    anchors.fill: parent
+                                                                    onClicked: root.openExternallyMsg(msgAudio.audioMsg)
+                                                                }
+                                                            }
+                                                        }
+
+                                                        PlasmaComponents.Label {
+                                                            visible: String(root.audioErrorMsgId) === String(msgAudio.audioMsg.id) && root.audioError !== ""
+                                                            text: root.audioError
+                                                            font.pointSize: 7.5
+                                                            color: "#e06666"
+                                                            wrapMode: Text.Wrap
+                                                            Layout.fillWidth: true
+                                                        }
+                                                    }
+                                                }
                                             }
 
                                             // Caption of a photo/video/sticker,
@@ -2657,6 +3172,79 @@ PlasmoidItem {
                             }
                         }
 
+                        // Voice-note bar: recording timer or draft
+                        // confirm. Replaces nothing — it stacks above the
+                        // message row while active.
+                        Rectangle {
+                            visible: root.voiceState !== "" || root.voiceError !== ""
+                            Layout.fillWidth: true
+                            height: visible ? 40 : 0
+                            color: root.colPanel
+                            radius: 8
+                            border.color: root.voiceState === "recording" ? "#c0392b" : root.colBorder
+                            border.width: 1
+
+                            RowLayout {
+                                anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
+                                spacing: 8
+
+                                Rectangle {
+                                    id: recDot
+                                    width: 10; height: 10; radius: 5
+                                    color: "#e74c3c"
+                                    visible: root.voiceState === "recording"
+                                }
+
+                                PlasmaComponents.Label {
+                                    text: {
+                                        if (root.voiceError !== "") return root.voiceError;
+                                        if (root.voiceState === "recording") return "Recording " + MsgUtils.formatDuration(root.voiceSecs);
+                                        if (root.voiceState === "draft") return "Voice note " + MsgUtils.formatDuration(root.voiceSecs);
+                                        return "";
+                                    }
+                                    font.pointSize: 9
+                                    font.bold: root.voiceState === "recording"
+                                    color: root.voiceError !== "" ? "#e06666" : root.colText
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+
+                                PlasmaComponents.ToolButton {
+                                    visible: root.voiceState === "draft"
+                                    icon.name: "media-playback-start"
+                                    display: PlasmaComponents.ToolButton.IconOnly
+                                    ToolTip.text: "Play draft"
+                                    ToolTip.visible: hovered
+                                    onClicked: root.playVoiceDraft()
+                                }
+
+                                PlasmaComponents.ToolButton {
+                                    visible: root.voiceState !== ""
+                                    icon.name: "edit-delete"
+                                    display: PlasmaComponents.ToolButton.IconOnly
+                                    ToolTip.text: "Discard"
+                                    ToolTip.visible: hovered
+                                    onClicked: root.discardVoiceNote()
+                                }
+
+                                Rectangle {
+                                    visible: root.voiceState === "draft"
+                                    width: 36; height: 36; radius: 18
+                                    color: root.colAccent
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "➤"
+                                        color: "#ffffff"
+                                        font.pointSize: 12
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.sendVoiceNote()
+                                    }
+                                }
+                            }
+                        }
+
                         RowLayout {
                             spacing: 8
                             Layout.fillWidth: true
@@ -2688,6 +3276,31 @@ PlasmoidItem {
                                 ToolTip.text: "Send file"
                                 ToolTip.visible: hovered
                                 onClicked: fileDialog.open()
+                            }
+
+                            // Voice-note button: same circular language as
+                            // the bubble play button; red only while recording.
+                            Rectangle {
+                                id: micButton
+                                width: 36; height: 36; radius: 18
+                                color: root.voiceState === "recording" ? "#c0392b" : root.colPanel
+                                border.color: root.colBorder
+                                border.width: 1
+                                opacity: !root.activeChat ? 0.4 : 1.0
+                                Behavior on color { ColorAnimation { duration: 150 } }
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: root.voiceState === "recording" ? "■" : "🎙"
+                                    font.pointSize: root.voiceState === "recording" ? 11 : 15
+                                }
+                                ToolTip.text: root.voiceState === "recording" ? "Stop recording" : "Record voice note"
+                                ToolTip.visible: micMouse.containsMouse
+                                MouseArea {
+                                    id: micMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    onClicked: root.toggleVoiceNote()
+                                }
                             }
 
                             // Input text box
@@ -2930,12 +3543,11 @@ PlasmoidItem {
                                         hoverEnabled: true
                                         onClicked: root.selectedEmojiCategory = index
                                     }
-                                }
                             }
                         }
-                    }
+                }
 
-                    Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
+                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
                     // Scrolling vertical emoji grid
                     PlasmaComponents.ScrollView {

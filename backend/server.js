@@ -719,6 +719,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                             id: m.id && m.id._serialized || String(m.id || Math.random()),
                             body: m.body || m.content || '',
                             caption: m.caption || '',
+                            waveform: Array.isArray(m.waveform) ? Array.from(m.waveform).slice(0, 128) : [],
+                            duration: Number(m.duration) > 0 ? Math.floor(Number(m.duration)) : 0,
                             type: m.type || 'chat',
                             t: m.t || 0,
                             fromMe: !!(m.id && m.id.fromMe),
@@ -791,6 +793,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                                             id: msg.id._serialized,
                                             body: msg.body || msg.content || '',
                                             caption: msg.caption || '',
+                                            waveform: Array.isArray(msg.waveform) ? Array.from(msg.waveform).slice(0, 128) : [],
+                                            duration: Number(msg.duration) > 0 ? Math.floor(Number(msg.duration)) : 0,
                                             type: msg.type || 'chat',
                                             t: msg.t || 0,
                                             fromMe: !!(msg.id && msg.id.fromMe),
@@ -1096,7 +1100,7 @@ app.post('/api/getMedia', async (req, res) => {
     }
 });
 
-// ── openExternally: full-res image → temp file → system viewer via xdg-open ─
+// ── openExternally: full-res media → temp file → system viewer via xdg-open ─
 // POST /api/openExternally { chatId, msgId } → { response: { path } }.
 // Full-res (maxEdge 0) via the shared helper (LRU hit avoids re-download).
 // Errors: 400 missing params; 404/502/503 passthrough from media fetch;
@@ -1116,18 +1120,20 @@ app.post('/api/openExternally', async (req, res) => {
         return res.status(500).json({ error: msg });
     }
 
-    const m = /^data:image\/jpeg;base64,(.+)$/.exec(String(data.dataUrl || ''));
+    const m = /^data:([a-z]+\/[a-z0-9.+-]+);base64,(.+)$/.exec(String(data.dataUrl || ''));
     if (!m) {
-        return res.status(500).json({ error: 'Unexpected media encoding', detail: 'expected jpeg dataUrl' });
+        return res.status(500).json({ error: 'Unexpected media encoding', detail: 'expected dataUrl' });
     }
+    const extFor = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'video/mp4': 'mp4' };
+    const ext = extFor[String(m[1]).toLowerCase().split(';')[0]] || 'bin';
     let buf;
     try {
-        buf = Buffer.from(m[1], 'base64');
+        buf = Buffer.from(m[2], 'base64');
     } catch (e) {
         return res.status(500).json({ error: 'Could not decode media', detail: String((e && e.message) || e) });
     }
     const safe = mediaLib.sanitizeMsgId(parsed.msgId);
-    const file = path.join(os.tmpdir(), 'whatsapp-kde-media-' + safe + '.jpg');
+    const file = path.join(os.tmpdir(), 'whatsapp-kde-media-' + safe + '.' + ext);
     try {
         fs.writeFileSync(file, buf);
     } catch (e) {
