@@ -308,10 +308,10 @@ PlasmoidItem {
 
     function copyToClipboard(text) {
         if (!text) return;
-        clipTextEdit.text = text;
-        clipTextEdit.selectAll();
-        clipTextEdit.copy();
-        clipTextEdit.deselect();
+        contextMenuButtons.clipEdit.text = text;
+        contextMenuButtons.clipEdit.selectAll();
+        contextMenuButtons.clipEdit.copy();
+        contextMenuButtons.clipEdit.deselect();
         root.copyToastVisible = true;
         copyToastTimer.restart();
     }
@@ -2234,7 +2234,7 @@ PlasmoidItem {
                                 onClicked: function(mouse) {
                                     if (mouse.button === Qt.RightButton) {
                                         root.contextChat = modelData;
-                                        chatContextMenu.popup(chatRow, mouse.x, mouse.y);
+                                        root.menus.chatContextMenu.popup(chatRow, mouse.x, mouse.y);
                                     } else {
                                         root.activeChat = {
                                             id:      modelData.id,
@@ -2622,7 +2622,7 @@ PlasmoidItem {
                                 enabled: systemText === ""
                                 onClicked: function(mouse) {
                                     root.contextReplyMsg = modelData;
-                                    msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
+                                    root.menus.msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
                                 }
                             }
 
@@ -3843,44 +3843,20 @@ PlasmoidItem {
         }
     }
 
-// Pure-QML clipboard helper (TextEdit.selectAll + copy)
-    TextEdit {
-        id: clipTextEdit
-        visible: false
-        width: 0; height: 0
+    // Hidden clipboard helper (ContextMenuButtons.qml). Exposed as a property so
+    // code in other files can reach it as `root.contextMenuButtons.clipEdit`.
+    readonly property alias contextMenuButtons: clipboardHelper
+    ContextMenuButtons {
+        id: clipboardHelper
+        root: root
     }
 
-    // Right-click context menu for messages
-    Menu {
-        id: msgContextMenu
-        title: "Message"
-
-        MenuItem {
-            text: "Reply"
-            icon.name: "mail-reply-sender"
-            onClicked: root.startReplyFromContext()
-        }
-        MenuItem {
-            text: "Copy message"
-            icon.name: "edit-copy"
-            onClicked: root.copyContextMessage()
-        }
-    }
-
-    // Right-click context menu for chat list rows
-    Menu {
-        id: chatContextMenu
-        title: "Chat"
-
-        MenuItem {
-            text: (root.contextChat && root.isChatPinned(root.contextChat)) ? "Unpin Chat" : "Pin Chat"
-            icon.name: "bookmark-new"
-            onClicked: {
-                if (root.contextChat) {
-                    root.togglePinChat(root.contextChat.id);
-                }
-            }
-        }
+    // Right-click context menus (Menus.qml). Exposed as a property so delegate code
+    // in other files can call `root.menus.<popup>.popup(...)`.
+    readonly property alias menus: menusObj
+    Menus {
+        id: menusObj
+        root: root
     }
 
     // "Copied" toast
