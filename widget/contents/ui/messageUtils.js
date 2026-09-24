@@ -253,6 +253,44 @@ function audioDuration(msg) {
     return 0;
 }
 
+// System / non-renderable messages: WhatsApp types that carry no body and no
+// media — call logs (type `call_log`), deleted messages (`revoked`), group
+// notifications (`notification`/`gp2`), protocol notices, etc. Without this
+// branch the bubble renders as an empty pill showing only the timestamp.
+function isSystemMessage(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    var body = typeof msg.body === 'string' ? msg.body : '';
+    if (body) return false;                 // has text to render
+    if (msg.caption) return false;          // captioned media renders text
+    if (msg.isRevoked) return true;
+    var type = msg.type || '';
+    if (type === 'image' || type === 'video' || type === 'sticker') return false; // media placeholder/viewer
+    if (isAudioMessage(msg)) return false;
+    if (typeof msg.thumbUrl === 'string' && msg.thumbUrl) return false;           // thumb is on its way
+    if (isMediaBody(body)) return false;
+    return true;                            // nothing renderable -> system row
+}
+
+// Display text for a system message ('' when it is not one). Used both by the
+// message bubble (rendered as a centered gray row) and the chat-list preview.
+function systemMessageText(msg) {
+    if (!isSystemMessage(msg)) return '';
+    if (msg.isRevoked || msg.type === 'revoked') return '🚫 This message was deleted';
+    var type = msg.type || '';
+    if (type === 'call_log') {
+        var sub = msg.subtype || '';
+        if (sub.indexOf('video') !== -1) return '📞 Missed video call';
+        if (sub.indexOf('miss') !== -1) return '📞 Missed voice call';
+        return '📞 Call';
+    }
+    if (type === 'notification' || type === 'gp2') return 'ℹ️ Group notification';
+    if (type === 'e2e_notification') return '🔒 Messages and calls are end-to-end encrypted.';
+    // Typed messages without dedicated renderers keep their emoji label.
+    var label = mediaLabel(type);
+    if (label) return label;
+    return 'Unsupported message';
+}
+
 function formatDuration(totalSecs) {
     var s = Math.max(0, Math.floor(Number(totalSecs) || 0));
     var m = Math.floor(s / 60);
@@ -268,6 +306,8 @@ if (typeof module !== 'undefined' && module.exports) {
         isAudioMessage: isAudioMessage,
         audioDuration: audioDuration,
         formatDuration: formatDuration,
+        isSystemMessage: isSystemMessage,
+        systemMessageText: systemMessageText,
         mediaLabel: mediaLabel,
         copyTextForMessage: copyTextForMessage,
         replyPreviewText: replyPreviewText,

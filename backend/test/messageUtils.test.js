@@ -116,7 +116,7 @@ test('mediaSource builds data URLs like the old inline QML logic', () => {
     assert.equal(utils.mediaSource({ body: 'iVBORw0KGgoXYZ' }), 'data:image/png;base64,iVBORw0KGgoXYZ');
     assert.equal(utils.mediaSource({ body: 'data:image/webp;base64,AAA' }), 'data:image/webp;base64,AAA');
     assert.equal(utils.mediaSource({ body: '' }), '');
-    assert.equal(utils.mediaSource({ body: 'plain text' }), 'data:image/jpeg;base64,plain text');
+    assert.equal(utils.mediaSource({ body: 'plain text' }), '');
     assert.equal(utils.mediaSource(null), '');
 });
 
@@ -149,8 +149,8 @@ test('needsThumb is false for text and msgs already carrying thumbUrl/full body'
     assert.equal(utils.needsThumb({ type: 'chat', body: 'hello' }), false);
     assert.equal(utils.needsThumb({ type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,AAA' }), false);
     assert.equal(utils.needsThumb({ _thumb: true, type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,AAA' }), false);
-    assert.equal(utils.needsThumb({ type: 'image', body: '/9j/ABC' }), false);
-    assert.equal(utils.needsThumb({ type: 'video', body: '/9j/VID' }), false);
+    assert.equal(utils.needsThumb({ type: 'image', body: '/9j/' + 'A'.repeat(5000) }), false);
+    assert.equal(utils.needsThumb({ type: 'video', body: '/9j/' + 'V'.repeat(5000) }), false);
 });
 
 test('mediaSource prefers thumbUrl when body is empty', () => {
@@ -181,4 +181,50 @@ test('buildMediaList includes typed media even with empty body (viewer resolves 
     ];
     const out = utils.buildMediaList(msgs);
     assert.deepEqual(out.map(function (m) { return m.id; }), ['m2', 'm6', 'm7', 'm8', 'm9', 'm10']);
+});
+
+// ── System / non-renderable messages (empty-bubble bug) ──────────────────────
+
+test('isSystemMessage flags empty-body non-media WhatsApp system types', () => {
+    // Live-observed payload: call_log with empty body rendered a timestamp-only pill.
+    assert.equal(utils.isSystemMessage({ type: 'call_log', body: '', caption: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'notification', body: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'gp2', body: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'e2e_notification', body: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'revoked', body: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'chat', body: '', isRevoked: true }), true);
+    assert.equal(utils.isSystemMessage({ type: 'mystery_type', body: '' }), true);
+    assert.equal(utils.isSystemMessage({ type: 'chat', body: '' }), true); // unextractable text -> label beats empty pill
+    assert.equal(utils.isSystemMessage(null), false);
+});
+
+test('isSystemMessage is false for anything with renderable content', () => {
+    assert.equal(utils.isSystemMessage({ type: 'chat', body: 'hello' }), false);
+    assert.equal(utils.isSystemMessage({ type: 'image', body: '' }), false);
+    assert.equal(utils.isSystemMessage({ type: 'sticker', body: '' }), false);
+    assert.equal(utils.isSystemMessage({ type: 'image', body: '', thumbUrl: 'data:image/jpeg;base64,T' }), false);
+    assert.equal(utils.isSystemMessage({ type: 'ptt', body: '', waveform: [1, 2] }), false);
+    assert.equal(utils.isSystemMessage({ type: 'chat', body: '/9j/abc' }), false);
+    assert.equal(utils.isSystemMessage({ type: 'image', body: 'the caption text' }), false);
+});
+
+test('systemMessageText maps system types to readable labels', () => {
+    assert.equal(utils.systemMessageText({ type: 'call_log', body: '' }), '📞 Call');
+    assert.equal(utils.systemMessageText({ type: 'call_log', body: '', subtype: 'miss_call' }), '📞 Missed voice call');
+    assert.equal(utils.systemMessageText({ type: 'call_log', body: '', subtype: 'miss_video' }), '📞 Missed video call');
+    assert.equal(utils.systemMessageText({ type: 'notification', body: '' }), 'ℹ️ Group notification');
+    assert.equal(utils.systemMessageText({ type: 'gp2', body: '' }), 'ℹ️ Group notification');
+    assert.equal(utils.systemMessageText({ type: 'e2e_notification', body: '' }), '🔒 Messages and calls are end-to-end encrypted.');
+    assert.equal(utils.systemMessageText({ type: 'revoked', body: '' }), '🚫 This message was deleted');
+    assert.equal(utils.systemMessageText({ type: 'chat', body: '', isRevoked: true }), '🚫 This message was deleted');
+    assert.equal(utils.systemMessageText({ type: 'location', body: '' }), '📍 Location');
+    assert.equal(utils.systemMessageText({ type: 'contact', body: '' }), '👤 Contact');
+    assert.equal(utils.systemMessageText({ type: 'totally_unknown', body: '' }), 'Unsupported message');
+});
+
+test('systemMessageText returns empty string for normal messages', () => {
+    assert.equal(utils.systemMessageText({ type: 'chat', body: 'hello' }), '');
+    assert.equal(utils.systemMessageText({ type: 'image', body: '' }), '');
+    assert.equal(utils.systemMessageText({ type: 'ptt', body: '' }), '');
+    assert.equal(utils.systemMessageText(null), '');
 });

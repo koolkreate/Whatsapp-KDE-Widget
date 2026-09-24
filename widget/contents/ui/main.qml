@@ -268,10 +268,14 @@ PlasmoidItem {
         else if (msg.type === "document") mediaLabel = "📄 Document";
         else if (msg.type === "sticker")  mediaLabel = "🪄 Sticker";
 
+        // System / non-renderable messages (call logs, deleted messages,
+        // group notices): show their emoji label instead of a blank preview.
         var body = msg.caption || msg.body || msg.content || "";
         var text;
         if (mediaLabel !== "") {
             text = body !== "" ? mediaLabel + " " + body : mediaLabel;
+        } else if (body === "" && MsgUtils.isSystemMessage(msg)) {
+            text = MsgUtils.systemMessageText(msg);
         } else {
             text = body;
         }
@@ -2476,8 +2480,10 @@ PlasmoidItem {
                         policy: ScrollBar.AsNeeded
                         background: Item {}
                     }
-                    Component.onCompleted: root.msgListViewRef = messageListView
-                        model: root.activeChatMessages
+                    Component.onCompleted: {
+                        root.msgListViewRef = messageListView;
+                    }
+                    model: root.activeChatMessages
                         spacing: 4
                         clip: true
                         // NOTE: deliberately NO reuseItems here. This delegate's
@@ -2577,7 +2583,9 @@ PlasmoidItem {
                             width: messageListView.width
                             // Use the column's full implicit height + padding for
                             // the reaction button that overflows below the bubble.
-                            height: msgBubbleCol.implicitHeight + 16
+                            height: systemText !== ""
+                                    ? sysLabel.implicitHeight + 8
+                                    : msgBubbleCol.implicitHeight + 16
 
                             // Media-with-caption plumbing. WhatsApp puts the
                             // caption text in `body`; a photo/video/sticker
@@ -2591,6 +2599,11 @@ PlasmoidItem {
                                 if (typeof cap !== "string" || MsgUtils.isMediaBody(cap)) return "";
                                 return cap;
                             }
+
+                            // System / non-renderable rows (call logs, deleted
+                            // messages, group notices): without this branch the
+                            // bubble collapsed to a timestamp-only pill.
+                            property string systemText: MsgUtils.systemMessageText(modelData)
 
                             // Test hooks for the agent test workflow (agent_test.sh).
                             objectName: "msgBubbleDelegate"
@@ -2606,6 +2619,7 @@ PlasmoidItem {
                             MouseArea {
                                 anchors.fill: parent
                                 acceptedButtons: Qt.RightButton
+                                enabled: systemText === ""
                                 onClicked: function(mouse) {
                                     root.contextReplyMsg = modelData;
                                     msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
@@ -2617,7 +2631,24 @@ PlasmoidItem {
                                 anchors { left: parent.left; right: parent.right }
                                 spacing: 0
 
+                                // System / non-renderable message (call log,
+                                // deleted message, group notice): centered gray
+                                // text row instead of a chat bubble.
+                                PlasmaComponents.Label {
+                                    id: sysLabel
+                                    visible: systemText !== ""
+                                    text: systemText
+                                    color: root.colSub
+                                    font.pointSize: 8.5
+                                    wrapMode: Text.Wrap
+                                    horizontalAlignment: Text.AlignHCenter
+                                    Layout.alignment: Qt.AlignHCenter
+                                    Layout.maximumWidth: parent.width * 0.9
+                                }
+
                                 RowLayout {
+                                    id: bubbleRow
+                                    visible: systemText === ""
                                     spacing: 8
                                     layoutDirection: modelData.fromMe ? Qt.RightToLeft : Qt.LeftToRight
 
@@ -3043,7 +3074,6 @@ PlasmoidItem {
                             }
                         }
                     }
-                }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
@@ -3549,11 +3579,12 @@ PlasmoidItem {
                                         hoverEnabled: true
                                         onClicked: root.selectedEmojiCategory = index
                                     }
+                                }
                             }
                         }
-                }
+                    }
 
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
+                    Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
 
                     // Scrolling vertical emoji grid
                     PlasmaComponents.ScrollView {
