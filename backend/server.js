@@ -50,6 +50,68 @@ let currentOpenChatId = null;
 const MSG_CACHE_TTL_MS = 3000;
 const MSG_CACHE_MAX = 200; // only ever return the most recent N messages
 const msgCache = new Map(); // chatId -> { t, sig, messages }
+
+// sig format: len:lastId:lastT:rxCount:rxMarkers where rxMarkers is emoji:1|0 (1=fromMe) joined by ',' in message/reaction order, so reaction-only edits change the sig.
+function msgIdOf(m) {
+    try {
+        const id = m && m.id;
+        return String((id && id._serialized) || id || '');
+    } catch (_) { return ''; }
+}
+// Accepts Node-shape ({emoji, fromMe}) and raw WA-shape ({orphan/emoji, sent_by_me}) entries.
+function reactionMarkerList(reactions) {
+    const out = [];
+    if (Array.isArray(reactions)) {
+        for (const r of reactions) {
+            const emoji = r && (r.emoji || r.orphan || r.reactionText);
+            if (!emoji) continue;
+            out.push(String(emoji) + ':' + ((r && (r.fromMe || r.sent_by_me)) ? '1' : '0'));
+        }
+    }
+    return out;
+}
+function computeMsgSig(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    const last = list.length ? list[list.length - 1] : {};
+    let rxCount = 0;
+    const rxParts = [];
+    for (const m of list) {
+        const marks = reactionMarkerList(m && m.reactions);
+        rxCount += marks.length;
+        for (const mk of marks) rxParts.push(mk);
+    }
+    return list.length + ':' + (msgIdOf(last) || '') + ':' + ((last && last.t) || 0) + ':' + rxCount + ':' + rxParts.join(',');
+}
+function sameReactions(a, b) {
+    const x = reactionMarkerList(a);
+    const y = reactionMarkerList(b);
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+}
+// since-filter that also surfaces reaction-only edits: messages excluded by
+// `since` but whose reactions differ from the previously cached snapshot are
+// included (order-preserving), so reaction polls never drop them. Pagination
+// (beforeId/limit) callers never pass `since` and are unaffected.
+function applySinceWithReactions(all, since, prev) {
+    const base = messagesLib.filterMessagesSince(all, since);
+    if (!since || !Array.isArray(prev) || !prev.length || !Array.isArray(all)) return base;
+    const prevById = new Map();
+    for (const p of prev) {
+        const id = msgIdOf(p);
+        if (id && !prevById.has(id)) prevById.set(id, p);
+    }
+    const inBase = new Set(base.map(msgIdOf));
+    const touched = new Set();
+    for (const m of all) {
+        const id = msgIdOf(m);
+        if (!id || inBase.has(id)) continue;
+        const p = prevById.get(id);
+        if (p && !sameReactions(p.reactions, m.reactions)) touched.add(id);
+    }
+    if (!touched.size) return base;
+    return all.filter(function (m) { const id = msgIdOf(m); return inBase.has(id) || touched.has(id); });
+}
 // Avatar bytes keyed by content hash; served via GET /api/avatar/<hash> so the
 // widget can use them as plain <img> sources (browser/QML caches the rest).
 const avatarStore = new Map();
@@ -822,6 +884,19 @@ app.post('/api/getChatMessages', async (req, res) => {
 
             // Method C: DOM scraping of main pane (final fallback)
             if (msgs.length <= 1) {
+                // Reactions scraped above (A/B) keyed by id plus a t::body
+                // fallback: DOM rows below get synthetic dom_msg_N ids, so an
+                // id-only map would never match. C only fires when
+                // msgs.length<=1, so fallback-key collision risk is negligible.
+                const priorRx = {};
+                try {
+                    for (const m of msgs) {
+                        if (m && Array.isArray(m.reactions) && m.reactions.length) {
+                            if (m.id != null) priorRx[String(m.id)] = m.reactions;
+                            priorRx['t::' + (m.t || 0) + '::' + (m.body || '')] = m.reactions;
+                        }
+                    }
+                } catch (_) { }
                 try {
                     const messageEls = document.querySelectorAll('#main [data-pre-plain-text], #main .message-in, #main .message-out');
                     if (messageEls.length > 0) {
@@ -845,6 +920,16 @@ app.post('/api/getChatMessages', async (req, res) => {
                             }
                         });
                         if (results.length > msgs.length) {
+                            // REQ-005/AC-005: never emit silent empty reactions where
+                            // A/B had them — carry over on id match or t::body
+                            // fallback-key match (extra DOM latency here is
+                            // acceptable per spec).
+                            for (const r of results) {
+                                if (!r.reactions || r.reactions.length === 0) {
+                                    const hit = priorRx[r.id] || priorRx['t::' + (r.t || 0) + '::' + (r.body || '')];
+                                    if (hit && hit.length) r.reactions = hit;
+                                }
+                            }
                             msgs = results;
                         }
                     }
@@ -870,7 +955,11 @@ app.post('/api/getChatMessages', async (req, res) => {
                 const p = messagesLib.paginateMessages(cached.messages, pageArgs);
                 return res.json({ response: p.page, sig: cached.sig, hasMore: p.hasMore });
             }
-            const out = since ? messagesLib.filterMessagesSince(cached.messages, since) : cached.messages;
+            // Reaction union on the hit path too: an interleaving scrape (e.g.
+            // scroll-up pagination) may have advanced the cache past the
+            // client's since while dropping touched rows. Redelivery is
+            // idempotent via merge-by-id.
+            const out = since ? applySinceWithReactions(cached.messages, since, cached.prev || []) : cached.messages;
             return res.json({ response: out, sig: cached.sig });
         }
 
@@ -878,14 +967,15 @@ app.post('/api/getChatMessages', async (req, res) => {
 
         // Cap payload size and compute a cheap change signature.
         if (messages.length > MSG_CACHE_MAX) messages = messages.slice(-MSG_CACHE_MAX);
-        const lastMsg = messages.length ? messages[messages.length - 1] : {};
-        const sig = messages.length + ':' + (lastMsg.id || '') + ':' + (lastMsg.t || 0);
-        msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages });
+        const prevEntry = msgCache.get(chatId);
+        const prevMessages = prevEntry ? prevEntry.messages : null;
+        const sig = computeMsgSig(messages);
+        msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages, prev: prevMessages });
         if (pageArgs && !since) {
             const p = messagesLib.paginateMessages(messages, pageArgs);
             return res.json({ response: p.page, sig: sig, hasMore: p.hasMore });
         }
-        const out = since ? messagesLib.filterMessagesSince(messages, since) : messages;
+        const out = since ? applySinceWithReactions(messages, since, prevMessages) : messages;
         res.json({ response: out, sig: sig });
     } catch (e) {
         console.error('getChatMessages error:', e.message);
@@ -911,6 +1001,8 @@ app.post('/api/waitMessages', async (req, res) => {
         const out = await waitForSigChange({
             getSig: async function () {
                 const cached = msgCache.get(chatId);
+                // Probe shortcut stays by design: bounded <=TTL delay, while
+                // bypassing it would add a constant in-page evaluate load.
                 if (cached && (Date.now() - cached.t) < MSG_CACHE_TTL_MS) return cached.sig;
                 // Cheap probe: signature only, no full message extraction.
                 return await waPage.evaluate((cid) => {
@@ -931,7 +1023,37 @@ app.post('/api/waitMessages', async (req, res) => {
                         const arr = typeof chat.msgs.getModelsArray === 'function' ? chat.msgs.getModelsArray() : [];
                         const last = arr.length ? arr[arr.length - 1] : {};
                         const lid = last.id && last.id._serialized || last.id || '';
-                        return arr.length + ':' + lid + ':' + (last.t || 0);
+                        // sig format: len:lastId:lastT:rxCount:rxMarkers (must match computeMsgSig in Node).
+                        let rxCount = 0;
+                        const rxParts = [];
+                        try {
+                            const me = (window.Store && window.Store.MaybeMeUser) ? String(window.Store.MaybeMeUser) : '';
+                            // Same .map-over-entries pattern Methods A/B use: safe
+                            // for Array and Backbone-style collections (no positional indexing).
+                            const asArray = function (rs) {
+                                return Array.isArray(rs) ? rs : rs.map(function (x) { return x; });
+                            };
+                            for (let i = 0; i < arr.length; i++) {
+                                const rs = arr[i] && arr[i].reactions;
+                                if (!rs || !rs.length) continue;
+                                const marks = asArray(rs).map(function (r) {
+                                    const emo = r.orphan || r.emoji || r.reactionText || '';
+                                    if (!emo) return '';
+                                    let mine = !!r.sent_by_me;
+                                    try {
+                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                        if (me && sid) mine = mine || String(sid) === me;
+                                    } catch (_) { }
+                                    return emo + ':' + (mine ? '1' : '0');
+                                });
+                                for (let k = 0; k < marks.length; k++) {
+                                    if (!marks[k]) continue;
+                                    rxCount++;
+                                    rxParts.push(marks[k]);
+                                }
+                            }
+                        } catch (_) { }
+                        return arr.length + ':' + lid + ':' + (last.t || 0) + ':' + rxCount + ':' + rxParts.join(',');
                     } catch (e) { return ''; }
                 }, chatId);
             },
@@ -1250,6 +1372,9 @@ app.post('/api/sendReaction', async (req, res) => {
                             } catch (_) { }
                         }
                     }]);
+                    if (!reactionMod && typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 1: webpack scan matched nothing, falling through');
+                    }
                 }
 
                 // Find the Message collection to get the message object
@@ -1299,19 +1424,25 @@ app.post('/api/sendReaction', async (req, res) => {
                     }
                 }
 
+                if (!msg && typeof console !== 'undefined' && console.debug) {
+                    console.debug('sendReaction Method 1: message not found in collections, falling through');
+                }
                 if (msg) {
                     if (typeof msg.sendReaction === 'function') {
                         await msg.sendReaction(emoji, isRemove);
-                        return 'reacted';
+                        return 'M1';
                     }
                     // Try the reaction module
                     if (reactionMod && typeof reactionMod === 'function') {
                         await reactionMod(msg, emoji, isRemove);
-                        return 'reacted';
+                        return 'M1';
+                    }
+                    if (typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 1: no sendReaction affordance on message, falling through');
                     }
                 }
             } catch (e) {
-                console.log('sendReaction Method 1 failed:', e.message);
+                console.log('sendReaction Method 1 failed');
             }
 
             // ── Method 2: DOM interaction ─────────────────────────────────────
@@ -1333,7 +1464,28 @@ app.post('/api/sendReaction', async (req, res) => {
                     }
                 }
 
-                if (msgEl) {
+                if (msgEl && isRemove) {
+                    // Toggle-off (REQ-003): click the existing own-reaction chip
+                    // instead of opening the picker (which would re-add). When the
+                    // DOM offers no remove affordance, fall through to M3 — never
+                    // silently add on a remove request.
+                    let removed = false;
+                    try {
+                        const chip = msgEl.querySelector('[data-testid*="reaction"]') ||
+                            msgEl.querySelector('.reaction-chip') ||
+                            msgEl.querySelector('span[data-icon*="reaction"]');
+                        if (chip) {
+                            chip.click();
+                            await new Promise(r => setTimeout(r, 300));
+                            removed = true;
+                        } else if (typeof console !== 'undefined' && console.debug) {
+                            console.debug('sendReaction Method 2: no remove affordance in DOM, falling through to M3');
+                        }
+                    } catch (_) { }
+                    if (removed) return 'M2';
+                }
+
+                if (msgEl && !isRemove) {
                     // Hover over the message to reveal the reaction button
                     msgEl.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                     await new Promise(r => setTimeout(r, 300));
@@ -1373,34 +1525,102 @@ app.post('/api/sendReaction', async (req, res) => {
                                 }
                             }
                         }
-                        return 'reacted_via_dom';
+                        return 'M2';
+                    } else if (typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 2: reaction button not found, falling through');
                     }
+                } else if (!msgEl && typeof console !== 'undefined' && console.debug) {
+                    console.debug('sendReaction Method 2: message element not found, falling through');
                 }
             } catch (e) {
-                console.log('sendReaction Method 2 failed:', e.message);
+                console.log('sendReaction Method 2 failed');
+            }
+
+            // M3 verify helper: re-read the message's own-reaction entries
+            // (single lookup, same collection pattern M1 uses) and confirm the
+            // requested add/remove landed. Unverifiable (message not found)
+            // counts as success — only a confirmed mismatch fails.
+            async function verifyOwnReaction(tmid, temoji, twantRemove) {
+                try {
+                    let vmsg = null;
+                    if (typeof window.require !== 'undefined') {
+                        const vnames = ['WAWebMessageCollection', 'WAWebStore', 'Store'];
+                        for (const vn of vnames) {
+                            try {
+                                const vm = window.require(vn);
+                                const vcoll = vm.MessageCollection || vm.MsgCollection || (vm.default && (vm.default.Message || vm.default.Msg));
+                                if (vcoll && typeof vcoll.get === 'function') { vmsg = vcoll.get(tmid); break; }
+                            } catch (_) { }
+                        }
+                    }
+                    if (!vmsg) return true;
+                    const vrs = vmsg.reactions;
+                    if (!vrs) return !!twantRemove;
+                    try {
+                        const vme = (window.Store && window.Store.MaybeMeUser) ? String(window.Store.MaybeMeUser) : '';
+                        const list = Array.isArray(vrs) ? vrs : vrs.map(function (x) { return x; });
+                        let ownHas = false;
+                        const marks = list.map(function (r) {
+                            const e = r.orphan || r.emoji || r.reactionText || '';
+                            if (e !== temoji) return '';
+                            let mine = !!r.sent_by_me;
+                            try {
+                                const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                if (vme && sid) mine = mine || String(sid) === vme;
+                            } catch (_) { }
+                            return mine ? '1' : '';
+                        });
+                        for (let k = 0; k < marks.length; k++) {
+                            if (marks[k]) { ownHas = true; break; }
+                        }
+                        return twantRemove ? !ownHas : ownHas;
+                    } catch (_) { return true; }
+                } catch (_) { return true; }
             }
 
             // ── Method 3: Direct Store.react mutation ─────────────────────────
+            // REQ-003: forward isRemove (already plumbed as the 4th evaluate arg
+            // from the route handler) so toggle-off works here too.
             try {
                 // Use the WhatsApp webpack module for reacting
                 if (typeof window.require !== 'undefined') {
                     const Store = window.require('WAWebStore');
                     if (Store && Store.Msg && Store.Msg.react) {
-                        await Store.Msg.react(mid, emoji);
-                        return 'reacted';
+                        let done = false;
+                        try {
+                            await Store.Msg.react(mid, emoji, isRemove);
+                            done = await verifyOwnReaction(mid, emoji, isRemove);
+                            if (!done) {
+                                // Accepted but ignored the flag: alternate form once.
+                                await Store.Msg.react(mid, emoji, { remove: !!isRemove });
+                                done = await verifyOwnReaction(mid, emoji, isRemove);
+                            }
+                        } catch (_) {
+                            // Older builds take an options object for removal.
+                            await Store.Msg.react(mid, emoji, { remove: !!isRemove });
+                            done = await verifyOwnReaction(mid, emoji, isRemove);
+                        }
+                        if (!done) throw new Error('reaction not reflected');
+                        return 'M3';
                     }
                 }
             } catch (e) {
-                console.log('sendReaction Method 3 failed:', e.message);
+                console.log('sendReaction Method 3 failed');
             }
 
             throw new Error('Could not send reaction via any method');
         }, chatId, msgId, reaction, remove);
 
-        console.log(`sendReaction: reacted to ${msgId} with ${reaction}`);
-        res.json({ response: result || 'reacted' });
+        // AC-004/SEC-001: log only method + ok, never chat/message IDs, emoji, or payloads.
+        // Evaluate returns M1/M2/M3 only; response stays compat (reacted|reacted_via_dom).
+        const method = result || 'unknown';
+        console.log('sendReaction: ok method=' + method);
+        // GUD-001 cache-bust: a reaction changes messages without changing
+        // count/lastId/lastT, so drop the cached snapshot for a fresh scrape.
+        msgCache.delete(chatId);
+        res.json({ response: method === 'M2' ? 'reacted_via_dom' : 'reacted', method: method });
     } catch (e) {
-        console.error('sendReaction error:', e.message);
+        console.error('sendReaction error');
         res.status(500).json({ error: e.message });
     }
 });

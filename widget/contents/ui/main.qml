@@ -49,6 +49,8 @@ PlasmoidItem {
     signal messageSent(bool success)
     property bool   emojiPickerVisible: false
     property string activeReactionMsgId: ""  // msg id for reaction popup
+    property var    reactionInFlight: ({})  // msgId -> true while a reaction POST is outstanding
+    property var    _reactionSnapshots: ({}) // msgId -> reactions[] before optimistic apply (rollback)
     property string pendingReplyId: ""     // msg id being replied to (quoted send)
     property string replyPreviewLabel: ""  // short preview shown in the quote bar
     property var    contextReplyMsg: null  // message that was right-clicked
@@ -1677,19 +1679,111 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: {} }));
     }
 
+    // ── Optimistic reactions (REQ-002/AC-001) ─────────────────────────────
+    // Chip click and picker-with-activeReactionMsgId both funnel through
+    // sendReaction() below, so the optimistic apply lives here centrally.
+    // Add path pushes {emoji, sender:"", fromMe:true}; toggle-off removes
+    // one own entry for that emoji. Server truth replaces the optimistic
+    // entry via the existing merge path (mergeMessages by id in
+    // fetchMessages), for both full-fetch and since-poll arrivals.
+    function applyOptimisticReaction(msgId, emoji, remove) {
+        if (!msgId || !emoji) return;
+        var key = String(msgId);
+        var msgs = root.activeChatMessages;
+        var found = false;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === key) {
+                if (root._reactionSnapshots[key] === undefined) {
+                    var nextSnap = {};
+                    for (var k in root._reactionSnapshots) nextSnap[k] = root._reactionSnapshots[k];
+                    nextSnap[key] = msgs[i].reactions ? msgs[i].reactions.slice() : [];
+                    root._reactionSnapshots = nextSnap;
+                }
+                var cur = msgs[i].reactions ? msgs[i].reactions.slice() : [];
+                if (remove) {
+                    for (var r = 0; r < cur.length; r++) {
+                        if (cur[r] && String(cur[r].emoji) === String(emoji) && cur[r].fromMe) {
+                            cur.splice(r, 1);
+                            break;
+                        }
+                    }
+                } else {
+                    var hasOwn = false;
+                    for (var a = 0; a < cur.length; a++) {
+                        if (cur[a] && String(cur[a].emoji) === String(emoji) && cur[a].fromMe) { hasOwn = true; break; }
+                    }
+                    if (!hasOwn) cur.push({ emoji: emoji, sender: "", fromMe: true });
+                }
+                msgs[i].reactions = cur;
+                found = true;
+                break;
+            }
+        }
+        if (found) root.applyMessagesModel(msgs.slice());
+    }
+
+    function rollbackOptimisticReaction(msgId) {
+        var key = String(msgId);
+        if (root._reactionSnapshots[key] === undefined) return;
+        var prev = root._reactionSnapshots[key];
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === key) {
+                msgs[i].reactions = prev;
+                break;
+            }
+        }
+        root.applyMessagesModel(msgs.slice());
+    }
+
+    function clearReactionFlight(msgId) {
+        var key = String(msgId);
+        var f = {};
+        for (var k in root.reactionInFlight) { if (k !== key) f[k] = root.reactionInFlight[k]; }
+        root.reactionInFlight = f;
+        var s = {};
+        for (var k2 in root._reactionSnapshots) { if (k2 !== key) s[k2] = root._reactionSnapshots[k2]; }
+        root._reactionSnapshots = s;
+    }
+
     function sendReaction(chatId, msgId, reaction, remove) {
         if (!root.isConnected || !chatId || !msgId || !reaction) return;
+        var key = String(msgId);
+        // In-flight guard (spec section 9 double-click race): one send per
+        // msgId at a time; rapid toggles while a POST is outstanding are
+        // ignored so add/remove cannot interleave out of order.
+        if (root.reactionInFlight[key]) return;
+        var next = {};
+        for (var k in root.reactionInFlight) next[k] = root.reactionInFlight[k];
+        next[key] = true;
+        root.reactionInFlight = next;
+        var wantRemove = !!remove;
+        root.applyOptimisticReaction(msgId, reaction, wantRemove);
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/sendReaction");
         xhr.setRequestHeader("Content-Type",  "application/json");
         xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.timeout = 30000;
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             if (xhr.status === 200) {
-                fetchMessages(root.activeChat.id);
+                root.clearReactionFlight(msgId);
+                if (root.activeChat) fetchMessages(root.activeChat.id);
+            } else {
+                root.rollbackOptimisticReaction(msgId);
+                root.clearReactionFlight(msgId);
             }
         };
-        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction, remove: !!remove } }));
+        xhr.ontimeout = function() {
+            root.rollbackOptimisticReaction(msgId);
+            root.clearReactionFlight(msgId);
+        };
+        try {
+            xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction, remove: wantRemove } }));
+        } catch (e) {
+            root.rollbackOptimisticReaction(msgId);
+            root.clearReactionFlight(msgId);
+        }
     }
 
     // Paste: save the clipboard image as a DRAFT attachment. It is NOT sent
