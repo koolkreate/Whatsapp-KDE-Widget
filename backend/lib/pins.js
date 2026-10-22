@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+const DATA_DIR = process.env.WA_DATA_DIR || path.join(__dirname, '..', 'data');
 const PINS_FILE = path.join(DATA_DIR, 'pinned_chats.json');
 
 function ensureDataDir() {
