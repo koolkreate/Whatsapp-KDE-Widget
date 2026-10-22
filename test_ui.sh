@@ -12,8 +12,10 @@ BACKEND_DIR="$REPO_ROOT/backend"
 TESTS_DIR="$REPO_ROOT/tests"
 
 API="http://127.0.0.1:8002"
-# Keep the default key working, but allow CI/users to override it.
-API_KEY="${WA_API_KEY:-KDE_WHATSAPP_SECRET_KEY}"
+# The backend persists the effective key in this file. Prefer it over the
+# environment so the test uses exactly what the running backend loaded.
+CONFIG_FILE="${WA_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-kde-widget.ini}"
+API_KEY=""
 PASS=0
 FAIL=0
 RESULTS=""
@@ -41,6 +43,21 @@ else
     fail "Backend is NOT ready ($STATUS)"
     echo "⚠️  Cannot continue without a running backend."
     echo "   Run: systemctl --user start whatsapp-backend.service"
+    exit 1
+fi
+
+# The config file is written by the running backend, so it is authoritative.
+# WA_API_KEY remains a fallback for environments that cannot read the file.
+if [ -r "$CONFIG_FILE" ]; then
+    API_KEY=$(sed -n 's/^[[:space:]]*apiKey[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" 2>/dev/null \
+        | head -n1 | tr -d '\r' | sed 's/[[:space:]]*$//')
+fi
+if [ -z "$API_KEY" ]; then
+    API_KEY="${WA_API_KEY:-}"
+fi
+if [ -z "$API_KEY" ]; then
+    fail "API key not found in $CONFIG_FILE"
+    echo "⚠️  Start the backend first (it generates the key) or set WA_API_KEY."
     exit 1
 fi
 
@@ -352,6 +369,14 @@ else
     echo "  ⚠️  qmlscene not available, skipping QML compile gate"
 fi
 
+# Ensure the widget under test is built from this checkout. A stale install
+# can otherwise hide QML/key changes while the launched process stays alive.
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    if ! kpackagetool6 --type Plasma/Applet --upgrade "$WIDGET_DIR" >/dev/null 2>&1; then
+        kpackagetool6 --type Plasma/Applet --install "$WIDGET_DIR" >/dev/null 2>&1 || true
+    fi
+fi
+
 # Check widget is installed
 if ls ~/.local/share/plasma/plasmoids/org.kde.whatsappquick/ >/dev/null 2>&1; then
     pass "Widget installed in plasmoids directory"
@@ -372,6 +397,12 @@ if [ -d "$INSTALLED_UI" ]; then
         pass "Installed package contains all QML/JS files"
     else
         fail "Installed package missing files:$MISSING (reinstall cleanly)"
+    fi
+
+    if cmp -s "$WIDGET_DIR/contents/ui/main.qml" "$INSTALLED_UI/main.qml"; then
+        pass "Installed main.qml matches repo"
+    else
+        fail "Installed main.qml differs from repo (stale install)"
     fi
 else
     fail "Installed ui directory not found"

@@ -21,7 +21,7 @@ PlasmoidItem {
 
     // ── State ────────────────────────────────────────────────────────────────
     property string apiHost:      "http://127.0.0.1:8002"
-    property string apiKey:       "KDE_WHATSAPP_SECRET_KEY"
+    property string apiKey:       apiSettingsLoader.item ? apiSettingsLoader.item.apiKey : ""
     property Item messageInputRef: null
     property var    allChats:     []
     property var    filteredChats: []
@@ -59,6 +59,39 @@ PlasmoidItem {
     property bool   showArchived: false    // chat list is showing archived chats
     property string pendingAttachmentPath: "" // pasted image waiting to be sent
     property bool   copyToastVisible: false
+
+    // The backend generates a per-install key in the shared config file. The
+    // Loader lets us recreate Settings after startup so a widget that comes up
+    // before the backend still picks the key up once it is written.
+    Component {
+        id: apiSettingsComponent
+        Item {
+            width: 0
+            height: 0
+            Settings {
+                id: apiSettings
+                location: StandardPaths.writableLocation(StandardPaths.GenericConfigLocation).toString()
+                          + "/whatsapp-kde-widget.ini"
+                property string apiKey: ""
+            }
+            property alias apiKey: apiSettings.apiKey
+        }
+    }
+
+    Loader {
+        id: apiSettingsLoader
+        sourceComponent: apiSettingsComponent
+    }
+
+    Timer {
+        interval: 5000
+        repeat: true
+        running: root.apiKey.length === 0
+        onTriggered: {
+            apiSettingsLoader.active = false
+            apiSettingsLoader.active = true
+        }
+    }
 
     // ── Agent test workflow (agent_test.sh) ──────────────────────────────────
     // The driver (testDriver.js) is loaded dynamically on completion, and

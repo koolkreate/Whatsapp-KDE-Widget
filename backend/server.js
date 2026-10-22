@@ -21,6 +21,7 @@ const messagesLib = require('./lib/messages');
 const mediaLib = require('./lib/media');
 const pinsLib = require('./lib/pins');
 const archivesLib = require('./lib/archives');
+const apiKeyLib = require('./lib/apiKey');
 const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
@@ -33,7 +34,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = 8002;
-const API_KEY = 'KDE_WHATSAPP_SECRET_KEY';
+const API_KEY = apiKeyLib.loadOrCreateKey();
 const QR_PATH = path.join(__dirname, '..', 'qr.png');
 const DATA_DIR = path.join(__dirname, '_IGNORE_whatsapp-kde-session');
 
