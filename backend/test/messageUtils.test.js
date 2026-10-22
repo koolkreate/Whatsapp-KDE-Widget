@@ -51,11 +51,14 @@ test('replyPreviewText shows emoji label for media and empty string for nothing'
 
 // ── chatRecency / compareChats (Slice 1 sort) ────────────────────────────────
 
-test('chatRecency uses the newer of chat.t and lastMessage.t', () => {
-    assert.equal(utils.chatRecency({ t: 100, lastMessage: { t: 200 } }), 200);
-    assert.equal(utils.chatRecency({ t: 300, lastMessage: { t: 200 } }), 300);
+test('chatRecency prefers chat.t over a newer lastMessage timestamp', () => {
+    assert.equal(utils.chatRecency({ t: 100, lastMessage: { t: 200 } }), 100);
     assert.equal(utils.chatRecency({ t: 300 }), 300);
     assert.equal(utils.chatRecency({ lastMessage: { t: 150 } }), 150);
+    assert.equal(utils.chatRecency({ lastMessage: { t: 150, type: 'e2e_notification' } }), 0);
+    assert.equal(utils.chatRecency({ lastMessage: { t: 150, type: 'message_history_notice' } }), 0);
+    assert.equal(utils.chatRecency({ lastMessage: { t: 150, type: 'notification_template' } }), 0);
+    assert.equal(utils.chatRecency({ t: 0, lastMessage: { t: 150, type: 'chat' } }), 150);
     assert.equal(utils.chatRecency({}), 0);
     assert.equal(utils.chatRecency(null), 0);
 });
@@ -72,6 +75,17 @@ test('compareChats orders by recency when both unpinned', () => {
     const b = { name: 'b', lastMessage: { t: 200 } };
     assert.equal(utils.compareChats(a, b), 1);
     assert.equal(utils.compareChats(b, a), -1);
+});
+
+test('compareChats keeps sync-notice-only chats below active chats', () => {
+    const active = { name: 'Active', t: 1000 };
+    const notice = {
+        name: 'Old contact',
+        t: 0,
+        lastMessage: { type: 'e2e_notification', t: 999999 },
+    };
+    assert.equal(utils.compareChats(notice, active), 1);
+    assert.equal(utils.compareChats(active, notice), -1);
 });
 
 test('compareChats falls back to name asc as a stable tiebreak', () => {

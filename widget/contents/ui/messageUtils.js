@@ -212,9 +212,21 @@ function buildMediaList(msgs) {
 // chat — matches WhatsApp's bump-on-any-activity behaviour.
 function chatRecency(c) {
     if (!c) return 0;
-    var t1 = Number(c.t || 0);
-    var t2 = (c.lastMessage && Number(c.lastMessage.t)) || 0;
-    return Math.max(t1, t2);
+    var t = Number(c.t || 0);
+    // chat.t is WhatsApp's own activity timestamp and is authoritative.
+    if (t > 0) return t;
+    var lm = c.lastMessage;
+    if (!lm) return 0;
+    var type = String(lm.type || '');
+    // Encryption/history notices are stamped when WhatsApp syncs them, not
+    // when the chat last had activity. Using those timestamps yanks old
+    // chats to the top of the list (seen after a backend restart).
+    if (type === 'e2e_notification' ||
+        type === 'message_history_notice' ||
+        type === 'notification_template') {
+        return 0;
+    }
+    return Number(lm.t || 0);
 }
 
 // Chat-list view filter shared by the widget: decides which chats are
