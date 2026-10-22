@@ -20,6 +20,7 @@ const avatarsLib = require('./lib/avatars');
 const messagesLib = require('./lib/messages');
 const mediaLib = require('./lib/media');
 const pinsLib = require('./lib/pins');
+const archivesLib = require('./lib/archives');
 const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
@@ -453,6 +454,41 @@ app.post('/api/togglePinChat', (req, res) => {
     if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
     try {
         const updated = pinsLib.togglePin(chatId);
+        res.json({ response: updated });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── getArchivedChats ────────────────────────────────────────────────────────
+app.all('/api/getArchivedChats', (_req, res) => {
+    try {
+        const archived = archivesLib.getArchived();
+        res.json({ response: archived });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── setChatArchived ─────────────────────────────────────────────────────────
+app.post('/api/setChatArchived', (req, res) => {
+    const body = req.body || {};
+    const args = body.args || body;
+    const chatId = args.chatId || args.id;
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+    const raw = args.archived;
+    let archived;
+    if (raw === undefined) {
+        archived = true;
+    } else if (raw === true || raw === 1 || raw === 'true' || raw === '1') {
+        archived = true;
+    } else if (raw === false || raw === 0 || raw === 'false' || raw === '0') {
+        archived = false;
+    } else {
+        return res.status(400).json({ error: 'Invalid archived flag' });
+    }
+    try {
+        const updated = archivesLib.setArchived(chatId, archived);
         res.json({ response: updated });
     } catch (e) {
         res.status(500).json({ error: e.message });
