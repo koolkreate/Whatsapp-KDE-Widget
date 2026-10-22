@@ -86,7 +86,7 @@ test('mock ships reacted fixtures: own, others-only and multi-emoji', async () =
         [{ emoji: '👍', count: 1, senders: [''], fromMe: true }]);
 
     const others = byId(response, 'mock_msg_6');
-    assert.deepEqual(others.reactions, [{ emoji: '❤️', sender: 'Kwame', fromMe: false }]);
+    assert.deepEqual(others.reactions, [{ emoji: '❤️', sender: 'Alice', fromMe: false }]);
     const othersAgg = MsgUtils.aggregateReactions(others.reactions);
     assert.equal(othersAgg.length, 1);
     assert.equal(othersAgg[0].fromMe, false);
@@ -153,7 +153,7 @@ test('clicking an others-only chip adds own reaction (count grows, not removed)'
     assert.equal(chips.length, 1);
     assert.equal(chips[0].count, 1);
     assert.equal(chips[0].fromMe, false);
-    assert.deepEqual(chips[0].senders, ['Kwame']);
+    assert.deepEqual(chips[0].senders, ['Alice']);
 });
 
 // ── Sig changes on reaction-only edit (AC-001/005) ────────────────────────────

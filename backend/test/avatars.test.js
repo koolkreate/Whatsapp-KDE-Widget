@@ -51,11 +51,11 @@ test('avatarPayload handles null/empty base64', () => {
 // ── matchAvatarsToChats ──────────────────────────────────────────────────────
 test('matchAvatarsToChats maps chats to avatars by normalized name', () => {
     const chats = [
-        { id: 'a@x', name: 'Mesoma' },
+        { id: 'a@x', name: 'Alice' },
         { id: 'b@x', name: '  john  DOE ' },
     ];
     const dom = [
-        { name: 'mesoma', base64: 'AAAA' },
+        { name: 'alice', base64: 'AAAA' },
         { name: 'John Doe', base64: 'BBBB' },
     ];
     const map = avatars.matchAvatarsToChats(chats, dom);
@@ -70,8 +70,8 @@ test('matchAvatarsToChats ignores chats without a DOM avatar', () => {
 });
 
 test('matchAvatarsToChats skips DOM rows without base64', () => {
-    const chats = [{ id: 'a@x', name: 'Mesoma' }];
-    const map = avatars.matchAvatarsToChats(chats, [{ name: 'mesoma', base64: null }]);
+    const chats = [{ id: 'a@x', name: 'Alice' }];
+    const map = avatars.matchAvatarsToChats(chats, [{ name: 'alice', base64: null }]);
     assert.equal(map.size, 0);
 });
 
@@ -94,7 +94,7 @@ test('extractAvatars pulls title + data-uri image per chat row', () => {
     const rows = [{
         querySelector: function (sel) {
             if (sel.indexOf('cell-frame-title') !== -1) {
-                return { title: '', textContent: 'Mesoma' };
+                return { title: '', textContent: 'Alice' };
             }
             if (sel.indexOf('img') !== -1) {
                 return { getAttribute: function (n) { return n === 'src' ? 'data:image/jpeg;base64,' + longB64 : null; } };
@@ -104,7 +104,7 @@ test('extractAvatars pulls title + data-uri image per chat row', () => {
     }];
     const out = avatars.extractAvatars(fakeDoc(rows));
     assert.equal(out.length, 1);
-    assert.equal(out[0].name, 'Mesoma');
+    assert.equal(out[0].name, 'Alice');
     assert.equal(out[0].kind, 'data');
     assert.equal(out[0].base64, longB64);
 });
@@ -113,7 +113,7 @@ test('extractAvatars captures CDN https avatar urls with kind=https', () => {
     const rows = [{
         querySelector: function (sel) {
             if (sel.indexOf('cell-frame-title') !== -1) {
-                return { title: '', textContent: 'Mesoma' };
+                return { title: '', textContent: 'Alice' };
             }
             if (sel.indexOf('img') !== -1) {
                 return { getAttribute: function (n) { return n === 'src' ? 'https://media-lhr11-1.cdn.whatsapp.net/v/t61.24694' : null; } };
@@ -123,7 +123,7 @@ test('extractAvatars captures CDN https avatar urls with kind=https', () => {
     }];
     const out = avatars.extractAvatars(fakeDoc(rows));
     assert.equal(out.length, 1);
-    assert.equal(out[0].name, 'Mesoma');
+    assert.equal(out[0].name, 'Alice');
     assert.equal(out[0].kind, 'https');
     assert.equal(out[0].src, 'https://media-lhr11-1.cdn.whatsapp.net/v/t61.24694');
 });

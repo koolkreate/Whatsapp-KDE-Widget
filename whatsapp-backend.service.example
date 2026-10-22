@@ -5,12 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/projects/whatsapp-kde-widget/backend
+# Adjust these paths if the repository is not checked out at
+# ~/whatsapp-kde-widget (the widget's manage.sh writes an absolute-path
+# service automatically when you run `./manage.sh enable-autostart`).
+WorkingDirectory=%h/whatsapp-kde-widget/backend
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5
-StandardOutput=append:%h/projects/whatsapp-kde-widget/backend.log
-StandardError=append:%h/projects/whatsapp-kde-widget/backend.log
+StandardOutput=append:%h/whatsapp-kde-widget/backend.log
+StandardError=append:%h/whatsapp-kde-widget/backend.log
 
 [Install]
 WantedBy=default.target

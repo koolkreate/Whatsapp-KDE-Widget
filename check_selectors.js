@@ -1,9 +1,10 @@
 const puppeteer = require('./backend/node_modules/puppeteer-core');
+const chromePath = require('./test/chromePath');
 
 async function run() {
     console.log("Launching browser...");
     const browser = await puppeteer.launch({
-        executablePath: '/home/kwame-t/projects/whatsapp-kde-widget/chrome/linux-150.0.7871.24/chrome-linux64/chrome',
+        executablePath: chromePath(),
         headless: true,
         args: [
             '--no-sandbox',

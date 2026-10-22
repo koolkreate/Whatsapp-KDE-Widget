@@ -4,7 +4,16 @@
 # the widget in plasmawindowed for a live visual check + screenshot.
 set -euo pipefail
 
+# Derive every path from the script location so the suite runs from any
+# checkout directory (and from a tarball extracted anywhere).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WIDGET_DIR="$REPO_ROOT/widget"
+BACKEND_DIR="$REPO_ROOT/backend"
+TESTS_DIR="$REPO_ROOT/tests"
+
 API="http://127.0.0.1:8002"
+# Keep the default key working, but allow CI/users to override it.
+API_KEY="${WA_API_KEY:-KDE_WHATSAPP_SECRET_KEY}"
 PASS=0
 FAIL=0
 RESULTS=""
@@ -40,7 +49,7 @@ echo ""
 echo "── 2. getAllChats endpoint ───────────────────────────────"
 CHATS_RAW=$(curl -sf -X POST "$API/api/getAllChats" \
     -H "Content-Type: application/json" \
-    -H "X-API-Key: KDE_WHATSAPP_SECRET_KEY" \
+    -H "X-API-Key: $API_KEY" \
     -d '{"args":{}}' 2>/dev/null || echo "ERROR")
 
 if [ "$CHATS_RAW" = "ERROR" ]; then
@@ -94,7 +103,7 @@ echo "── 3. getChatMessages endpoint ─────────────
 if [ -n "$FIRST_CHAT_ID" ]; then
     MSGS_RAW=$(curl -sf -X POST "$API/api/getChatMessages" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: KDE_WHATSAPP_SECRET_KEY" \
+        -H "X-API-Key: $API_KEY" \
         -d "{\"args\":{\"chatId\":\"$FIRST_CHAT_ID\"}}" 2>/dev/null || echo "ERROR")
 
     if [ "$MSGS_RAW" = "ERROR" ]; then
@@ -197,7 +206,7 @@ if msgs:
     if [ -n "$SINCE_ARGS" ]; then
         INCR_RAW=$(curl -sf -X POST "$API/api/getChatMessages" \
             -H "Content-Type: application/json" \
-            -H "X-API-Key: KDE_WHATSAPP_SECRET_KEY" \
+            -H "X-API-Key: $API_KEY" \
             -d "{\"args\":{\"chatId\":\"$FIRST_CHAT_ID\",\"since\":$SINCE_ARGS}}" 2>/dev/null || echo "ERROR")
 
         if [ "$INCR_RAW" != "ERROR" ]; then
@@ -228,7 +237,7 @@ if [ -n "$FIRST_CHAT_ID" ]; then
     # Use a short timeout test — should return within a few seconds
     WAIT_RAW=$(timeout 8 curl -sf -X POST "$API/api/waitMessages" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: KDE_WHATSAPP_SECRET_KEY" \
+        -H "X-API-Key: $API_KEY" \
         -d "{\"args\":{\"chatId\":\"$FIRST_CHAT_ID\",\"sig\":\"test_invalid_sig\"}}" 2>/dev/null || echo "TIMEOUT_OR_ERROR")
 
     if [ "$WAIT_RAW" != "TIMEOUT_OR_ERROR" ]; then
@@ -260,7 +269,7 @@ if chats: print(chats[0].get('name', ''))
 
     AVATAR_RAW=$(curl -sf -X POST "$API/api/getAvatars" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: KDE_WHATSAPP_SECRET_KEY" \
+        -H "X-API-Key: $API_KEY" \
         -d "{\"args\":{\"chats\":[{\"id\":\"$FIRST_CHAT_ID\",\"name\":\"$FIRST_CHAT_NAME\"}],\"hashes\":{}}}" 2>/dev/null || echo "ERROR")
 
     if [ "$AVATAR_RAW" != "ERROR" ]; then
@@ -275,7 +284,6 @@ fi
 # ── 7. Widget QML syntax check ───────────────────────────────────────────────
 echo ""
 echo "── 7. Widget file integrity ─────────────────────────────"
-WIDGET_DIR="/home/kwame-t/projects/whatsapp-kde-widget/widget"
 
 # Check main.qml exists
 if [ -f "$WIDGET_DIR/contents/ui/main.qml" ]; then
@@ -372,7 +380,7 @@ fi
 # ── 8. Backend unit tests ────────────────────────────────────────────────────
 echo ""
 echo "── 8. Backend unit tests ────────────────────────────────"
-TEST_OUTPUT=$(cd /home/kwame-t/projects/whatsapp-kde-widget/backend && node --test 2>&1 || true)
+TEST_OUTPUT=$(cd "$BACKEND_DIR" && node --test 2>&1 || true)
 TEST_PASS=$(echo "$TEST_OUTPUT" | grep -oP '# pass \K\d+' || echo "0")
 TEST_FAIL=$(echo "$TEST_OUTPUT" | grep -oP '# fail \K\d+' || echo "0")
 TEST_TOTAL=$(echo "$TEST_OUTPUT" | grep -oP '# tests \K\d+' || echo "0")
@@ -390,10 +398,9 @@ fi
 # ── 9. QML unit tests (qmltestrunner) ────────────────────────────────────────
 echo ""
 echo "── 9. QML unit tests ────────────────────────────────────"
-QMLTEST_BIN="$(ls /usr/lib64/qt6/bin/qmltestrunner 2>/dev/null || command -v qmltestrunner 2>/dev/null || true)"
-TESTS_DIR="/home/kwame-t/projects/whatsapp-kde-widget/tests"
+QMLTEST_BIN="$(command -v qmltestrunner 2>/dev/null || ls /usr/lib64/qt6/bin/qmltestrunner 2>/dev/null || true)"
 if [ -n "$QMLTEST_BIN" ] && [ -d "$TESTS_DIR" ]; then
-    QMLTEST_OUT=$(cd /home/kwame-t/projects/whatsapp-kde-widget && QT_QPA_PLATFORM=offscreen "$QMLTEST_BIN" -input "$TESTS_DIR" 2>&1 || true)
+    QMLTEST_OUT=$(cd "$REPO_ROOT" && QT_QPA_PLATFORM=offscreen "$QMLTEST_BIN" -input "$TESTS_DIR" 2>&1 || true)
     QMLTEST_TOTALS=$(echo "$QMLTEST_OUT" | grep -oP 'Totals: \K\d+ passed, \d+ failed' || echo "")
     QMLTEST_FAILS=$(echo "$QMLTEST_OUT" | grep -oP 'Totals: \d+ passed, \K\d+' || echo "1")
     if [ "$QMLTEST_FAILS" = "0" ]; then
@@ -440,7 +447,7 @@ if command -v plasmawindowed &>/dev/null; then
 
         # Try to take a screenshot
         if command -v spectacle &>/dev/null; then
-            SCREENSHOT="/home/kwame-t/projects/whatsapp-kde-widget/test_screenshot.png"
+            SCREENSHOT="$REPO_ROOT/test_screenshot.png"
             spectacle -b -n -o "$SCREENSHOT" 2>/dev/null || true
             if [ -f "$SCREENSHOT" ]; then
                 pass "Screenshot saved to test_screenshot.png"

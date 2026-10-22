@@ -110,20 +110,20 @@ test('extractChatListRows pulls title + subtitle per chat row', () => {
     const rows = [{
         querySelectorAll: function () {
             return [
-                { title: 'Mesoma', textContent: 'Mesoma' },
+                { title: 'Alice', textContent: 'Alice' },
                 { title: 'Hey, are you there?', textContent: 'Hey, are you there?' },
             ];
         },
         querySelector: function (sel) {
             if (sel.indexOf('cell-frame-title') !== -1) {
-                return { title: 'Mesoma', textContent: 'Mesoma' };
+                return { title: 'Alice', textContent: 'Alice' };
             }
             return null;
         },
     }];
     const out = extractChatListRows({ querySelectorAll: function () { return rows; } });
     assert.equal(out.length, 1);
-    assert.equal(out[0].name, 'Mesoma');
+    assert.equal(out[0].name, 'Alice');
     assert.equal(out[0].body, 'Hey, are you there?');
 });
 

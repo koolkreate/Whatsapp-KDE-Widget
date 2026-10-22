@@ -32,7 +32,7 @@ test('mergeMessages replaces the emoji set (multi-emoji add and toggle-off remov
     const existing = [
         {
             id: 'm1', t: 100, reactions: [
-                { emoji: '❤️', sender: 'Kwame', fromMe: false },
+                { emoji: '❤️', sender: 'Alice', fromMe: false },
                 { emoji: '👍', sender: '', fromMe: true },
             ],
         },
@@ -41,8 +41,8 @@ test('mergeMessages replaces the emoji set (multi-emoji add and toggle-off remov
     const fresh = [
         {
             id: 'm1', t: 100, reactions: [
-                { emoji: '❤️', sender: 'Kwame', fromMe: false },
-                { emoji: '👍', sender: 'Ama', fromMe: false },
+                { emoji: '❤️', sender: 'Alice', fromMe: false },
+                { emoji: '👍', sender: 'Bob', fromMe: false },
                 { emoji: '😂', sender: '', fromMe: true },
             ],
         },
@@ -60,7 +60,7 @@ test('mergeMessages appends a brand-new reacted message in t order', () => {
     const existing = [{ id: 'm1', t: 100, reactions: [] }];
     const fresh = [
         { id: 'm1', t: 100, reactions: [] },
-        { id: 'm2', t: 200, reactions: [{ emoji: '🎉', sender: 'Ama', fromMe: false }] },
+        { id: 'm2', t: 200, reactions: [{ emoji: '🎉', sender: 'Bob', fromMe: false }] },
     ];
     const out = poll.mergeMessages(existing, fresh);
     assert.deepEqual(out.map(m => m.id), ['m1', 'm2']);

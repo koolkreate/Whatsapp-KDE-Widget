@@ -15,6 +15,8 @@
  */
 
 const http = require('http');
+const os = require('os');
+const path = require('path');
 
 const PORT = Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 8003;
 
@@ -48,7 +50,7 @@ const WAV_DATA_URL = silentWavDataUrl();
 
 // Canned voice-note file the driver sends through the real sendFile path
 // (the microphone itself can't exist headless). Written once at startup.
-const VOICE_FIXTURE_PATH = '/tmp/widvoice_fixture.ogg';
+const VOICE_FIXTURE_PATH = path.join(os.tmpdir(), 'widvoice_fixture.ogg');
 try {
     require('fs').writeFileSync(
         VOICE_FIXTURE_PATH,
@@ -85,7 +87,7 @@ function buildMessages() {
             type: 'chat',
             t: t0 + i * 60,
             fromMe: i % 3 === 0,
-            senderName: i % 3 === 0 ? '' : 'Kwame',
+            senderName: i % 3 === 0 ? '' : 'Alice',
             reactions: [],
         });
     }
@@ -97,10 +99,10 @@ function buildMessages() {
     //  - mock_msg_7: multi-emoji (aggregation order/count target).
     const reactedFixtures = {
         mock_msg_5: [{ emoji: '👍', sender: '', fromMe: true }],
-        mock_msg_6: [{ emoji: '❤️', sender: 'Kwame', fromMe: false }],
+        mock_msg_6: [{ emoji: '❤️', sender: 'Alice', fromMe: false }],
         mock_msg_7: [
-            { emoji: '❤️', sender: 'Kwame', fromMe: false },
-            { emoji: '👍', sender: 'Ama', fromMe: false },
+            { emoji: '❤️', sender: 'Alice', fromMe: false },
+            { emoji: '👍', sender: 'Bob', fromMe: false },
             { emoji: '👍', sender: '', fromMe: true },
         ],
     };
@@ -117,7 +119,7 @@ function buildMessages() {
         type: 'image',
         t: t0 + 44 * 60,
         fromMe: false,
-        senderName: 'Ama',
+        senderName: 'Bob',
         reactions: [],
     });
     // Inline-base64 photo without caption (raw body renders directly).
@@ -138,7 +140,7 @@ function buildMessages() {
         type: 'ptt',
         t: t0 + 46 * 60,
         fromMe: false,
-        senderName: 'Ama',
+        senderName: 'Bob',
         waveform: mockWaveform(),
         duration: 18,
         reactions: [],
@@ -158,7 +160,7 @@ function buildMessages() {
 }
 const state = {
     chats: {
-        [CHAT_A]: { id: CHAT_A, name: 'Ama Test', isGroup: false, unreadCount: 2, t: 0, msgs: buildMessages() },
+        [CHAT_A]: { id: CHAT_A, name: 'Bob Test', isGroup: false, unreadCount: 2, t: 0, msgs: buildMessages() },
         [CHAT_B]: {
             id: CHAT_B, name: 'Family Group', isGroup: true, unreadCount: 0, t: 0,
             msgs: [
@@ -269,7 +271,7 @@ function injectMessage(chatId, label) {
         type: 'chat',
         t: (last ? last.t : 0) + 60,
         fromMe: false,
-        senderName: 'Ama',
+        senderName: 'Bob',
         reactions: [],
     });
     c.t = c.msgs[c.msgs.length - 1].t;

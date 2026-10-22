@@ -36,7 +36,23 @@ const PORT = 8002;
 const API_KEY = 'KDE_WHATSAPP_SECRET_KEY';
 const QR_PATH = path.join(__dirname, '..', 'qr.png');
 const DATA_DIR = path.join(__dirname, '_IGNORE_whatsapp-kde-session');
-const CHROME = path.join(__dirname, '..', 'chrome', 'linux-150.0.7871.24', 'chrome-linux64', 'chrome');
+
+// Resolve the bundled Chrome without pinning a release version. CHROME_BIN
+// overrides the scan; the old path is only a last-resort fallback.
+function resolveChromePath() {
+    if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+    const chromeRoot = path.join(__dirname, '..', 'chrome');
+    try {
+        for (const version of fs.readdirSync(chromeRoot)) {
+            const candidate = path.join(chromeRoot, version, 'chrome-linux64', 'chrome');
+            if (fs.existsSync(candidate)) return candidate;
+        }
+    } catch (e) {
+        // No bundled Chrome in this checkout.
+    }
+    return path.join(chromeRoot, 'linux-150.0.7871.24', 'chrome-linux64', 'chrome');
+}
+const CHROME = resolveChromePath();
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 // ── State ───────────────────────────────────────────────────────────────────
