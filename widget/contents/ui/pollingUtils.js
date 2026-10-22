@@ -118,6 +118,23 @@ function settleMessages(currentMsgs, freshMsgs) {
     return reconcileOptimistic(merged);
 }
 
+// A cold chat open blocked by an in-flight request must be queued and retried,
+// never silently dropped (or the newly opened chat stays empty forever).
+function shouldQueueColdOpen(messagesInFlight, background) {
+    return !!messagesInFlight && !background;
+}
+
+// Drain a queued cold open only when that chat is still the open one.
+function consumePendingOpen(pendingId, activeChatId) {
+    if (!pendingId || !activeChatId || String(pendingId) !== String(activeChatId)) return '';
+    return pendingId;
+}
+
+// A wait-loop response belongs to a previous chat when its generation lags.
+function isStaleLoop(loopGen, currentGen) {
+    return loopGen !== currentGen;
+}
+
 // Debounce delay for the search field (default 150ms).
 function debounceDelay(ms) {
     return ms > 0 ? ms : 150;
@@ -131,6 +148,9 @@ if (typeof module !== 'undefined' && module.exports) {
         prependOlder: prependOlder,
         reconcileOptimistic: reconcileOptimistic,
         settleMessages: settleMessages,
+        shouldQueueColdOpen: shouldQueueColdOpen,
+        consumePendingOpen: consumePendingOpen,
+        isStaleLoop: isStaleLoop,
         debounceDelay: debounceDelay
     };
 }

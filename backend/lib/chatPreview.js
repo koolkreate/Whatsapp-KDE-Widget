@@ -36,7 +36,7 @@ function extractLastMessage(chat) {
 
         if (!lm) return null;
 
-        let body = lm.body || lm.caption || lm.quotedBody || '';
+        let body = lm.caption || lm.body || lm.quotedBody || '';
         if (typeof body !== 'string') body = String(body || '');
         // Media messages on current WA Web can carry the raw media bytes as a
         // base64 string in `body` (e.g. JPEG "/9j/...", PNG "iVBOR..."). Those
@@ -53,6 +53,21 @@ function extractLastMessage(chat) {
             senderName = snd.formattedTitle || snd.pushname || snd.name || snd.shortName || '';
         }
         if (!senderName) senderName = lm.senderTitle || lm.notifyName || '';
+        if (!senderName) {
+            const author = lm.author || lm.participant || '';
+            const authorId = typeof author === 'string' ? author : (author && (author._serialized || author.user)) || '';
+            if (authorId && typeof window !== 'undefined' && window.require) {
+                try {
+                    const cm = window.require('WAWebContactCollection');
+                    const cc = cm && (cm.ContactCollection || cm.ContactCollectionImpl);
+                    const contact = cc && typeof cc.get === 'function' ? cc.get(String(authorId)) : null;
+                    if (contact) {
+                        senderName = contact.pushname || contact.verifiedName ||
+                            contact.formattedName || contact.name || contact.shortName || '';
+                    }
+                } catch (e) { }
+            }
+        }
 
         return {
             body: body,
@@ -65,6 +80,17 @@ function extractLastMessage(chat) {
     } catch (e) {
         return null;
     }
+}
+
+// Group detection from the wire format. WhatsApp Web chat models rarely
+// expose `isGroup`, but group ids always end in @g.us — trust the id when
+// the flag is missing so group UI (avatars, sender names) keys correctly.
+function isGroupChat(chat) {
+    if (!chat || typeof chat !== 'object') return false;
+    if (chat.isGroup) return true;
+    const id = chat.id;
+    const serial = (id && id._serialized) || id;
+    return /@g\.us$/i.test(String(serial || ''));
 }
 
 // In-page: scrape chat-list rows for name + subtitle (last-message preview
@@ -107,4 +133,4 @@ function extractChatListRows(doc) {
     }
 }
 
-module.exports = { extractLastMessage, extractChatListRows };
+module.exports = { extractLastMessage, extractChatListRows, isGroupChat };

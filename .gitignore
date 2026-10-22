@@ -27,3 +27,17 @@ eval_payload.json
 *.md
 *.html
 
+# Fetched Qt agent skills (third-party, project-local)
+.opencode/skills/qt-cmake-project/
+.opencode/skills/qt-cpp-docs/
+.opencode/skills/qt-cpp-review/
+.opencode/skills/qt-figma-component-generation/
+.opencode/skills/qt-figma-token-extraction/
+.opencode/skills/qt-qml/
+.opencode/skills/qt-qml-docs/
+.opencode/skills/qt-qml-profiler/
+.opencode/skills/qt-qml-review/
+.opencode/skills/qt-qml-test/
+.opencode/skills/qt-qml-test-run/
+.opencode/skills/qt-ui-design/
+

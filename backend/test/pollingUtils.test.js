@@ -50,7 +50,28 @@ test('mergeMessages is a no-op when fresh is empty', () => {
     assert.deepEqual(poll.mergeMessages(existing, []), existing);
 });
 
-// ── debounce decision (pure helper for the search bar) ──────────────────────
+// ── Cold-open queue (never silently drop a chat open) ───────────────────────
+test('shouldQueueColdOpen queues a cold open blocked by an in-flight poll', () => {
+    assert.equal(poll.shouldQueueColdOpen(true, false), true);
+    assert.equal(poll.shouldQueueColdOpen(true, undefined), true);
+});
+
+test('shouldQueueColdOpen never queues background polls', () => {
+    assert.equal(poll.shouldQueueColdOpen(true, true), false);
+    assert.equal(poll.shouldQueueColdOpen(false, false), false);
+});
+
+test('consumePendingOpen drains only when the pending chat is still open', () => {
+    assert.equal(poll.consumePendingOpen('chatB', 'chatB'), 'chatB');
+    assert.equal(poll.consumePendingOpen('chatB', 'chatC'), '');
+    assert.equal(poll.consumePendingOpen('', 'chatB'), '');
+});
+
+// ── Wait-loop generation ─────────────────────────────────────────────────────
+test('isStaleLoop detects a loop from a previous chat', () => {
+    assert.equal(poll.isStaleLoop(1, 2), true);
+    assert.equal(poll.isStaleLoop(2, 2), false);
+});
 test('debounceDelay returns the configured delay', () => {
     assert.equal(poll.debounceDelay(150), 150);
     assert.equal(poll.debounceDelay(0), 150); // falls back to default

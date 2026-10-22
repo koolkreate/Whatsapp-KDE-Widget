@@ -18,11 +18,14 @@ const puppeteer = require('./node_modules/puppeteer-core');
 const replyLib = require('./lib/reply');
 const avatarsLib = require('./lib/avatars');
 const messagesLib = require('./lib/messages');
+const mediaLib = require('./lib/media');
 const pinsLib = require('./lib/pins');
+const archivesLib = require('./lib/archives');
 const chatPreviewLib = require('./lib/chatPreview');
 const { waitForSigChange } = require('./lib/longPoll');
 const express = require('express');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { exec } = require('child_process');
 
@@ -48,6 +51,68 @@ let currentOpenChatId = null;
 const MSG_CACHE_TTL_MS = 3000;
 const MSG_CACHE_MAX = 200; // only ever return the most recent N messages
 const msgCache = new Map(); // chatId -> { t, sig, messages }
+
+// sig format: len:lastId:lastT:rxCount:rxMarkers where rxMarkers is emoji:1|0 (1=fromMe) joined by ',' in message/reaction order, so reaction-only edits change the sig.
+function msgIdOf(m) {
+    try {
+        const id = m && m.id;
+        return String((id && id._serialized) || id || '');
+    } catch (_) { return ''; }
+}
+// Accepts Node-shape ({emoji, fromMe}) and raw WA-shape ({orphan/emoji, sent_by_me}) entries.
+function reactionMarkerList(reactions) {
+    const out = [];
+    if (Array.isArray(reactions)) {
+        for (const r of reactions) {
+            const emoji = r && (r.emoji || r.orphan || r.reactionText);
+            if (!emoji) continue;
+            out.push(String(emoji) + ':' + ((r && (r.fromMe || r.sent_by_me)) ? '1' : '0'));
+        }
+    }
+    return out;
+}
+function computeMsgSig(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    const last = list.length ? list[list.length - 1] : {};
+    let rxCount = 0;
+    const rxParts = [];
+    for (const m of list) {
+        const marks = reactionMarkerList(m && m.reactions);
+        rxCount += marks.length;
+        for (const mk of marks) rxParts.push(mk);
+    }
+    return list.length + ':' + (msgIdOf(last) || '') + ':' + ((last && last.t) || 0) + ':' + rxCount + ':' + rxParts.join(',');
+}
+function sameReactions(a, b) {
+    const x = reactionMarkerList(a);
+    const y = reactionMarkerList(b);
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+}
+// since-filter that also surfaces reaction-only edits: messages excluded by
+// `since` but whose reactions differ from the previously cached snapshot are
+// included (order-preserving), so reaction polls never drop them. Pagination
+// (beforeId/limit) callers never pass `since` and are unaffected.
+function applySinceWithReactions(all, since, prev) {
+    const base = messagesLib.filterMessagesSince(all, since);
+    if (!since || !Array.isArray(prev) || !prev.length || !Array.isArray(all)) return base;
+    const prevById = new Map();
+    for (const p of prev) {
+        const id = msgIdOf(p);
+        if (id && !prevById.has(id)) prevById.set(id, p);
+    }
+    const inBase = new Set(base.map(msgIdOf));
+    const touched = new Set();
+    for (const m of all) {
+        const id = msgIdOf(m);
+        if (!id || inBase.has(id)) continue;
+        const p = prevById.get(id);
+        if (p && !sameReactions(p.reactions, m.reactions)) touched.add(id);
+    }
+    if (!touched.size) return base;
+    return all.filter(function (m) { const id = msgIdOf(m); return inBase.has(id) || touched.has(id); });
+}
 // Avatar bytes keyed by content hash; served via GET /api/avatar/<hash> so the
 // widget can use them as plain <img> sources (browser/QML caches the rest).
 const avatarStore = new Map();
@@ -172,6 +237,59 @@ app.use((req, res, next) => {
 // lib/avatars.js pattern. The two helpers are injected the same way.
 function getAllChatsInPage(extractLastMessage, extractChatListRows) {
 
+    // ── Contact collection for chat-name resolution ──────────────────────
+    // LID-migrated 1-1 chats carry the raw phone number in formattedTitle
+    // while the saved contact name lives on chat.contact / the contact
+    // collection. Located once, used by resolveChatName below.
+    let nameColl = null;
+    try {
+        if (typeof window.require !== 'undefined') {
+            const contactMod = window.require('WAWebContactCollection');
+            const cc = contactMod.ContactCollection || contactMod.ContactCollectionImpl;
+            if (cc && typeof cc.get === 'function') nameColl = cc;
+        }
+    } catch (e) { }
+
+    // Prefer the chat's own title unless it is empty or number-like; then
+    // prefer the saved contact name (chat.contact, else collection lookup
+    // by chat id). Never throws and never blanks: worst case the raw title
+    // survives, so unsaved contacts keep showing their number.
+    function looksLikeNumber(s) {
+        var t = String(s == null ? '' : s).trim();
+        if (t.length < 5) return false;
+        if (/[a-zA-Z]/.test(t)) return false;
+        var digits = t.replace(/\D/g, '');
+        return digits.length >= 5;
+    }
+    function contactDisplayName(contact) {
+        if (!contact) return '';
+        var n = null;
+        try {
+            n = contact.name || contact.pushname || contact.verifiedName ||
+                contact.formattedName || contact.shortName || '';
+        } catch (e) { n = ''; }
+        return n || '';
+    }
+    function resolveChatName(chat, rawName) {
+        try {
+            var name = String(rawName == null ? '' : rawName);
+            if (name && !looksLikeNumber(name)) return name;
+            var contact = null;
+            try { contact = (chat && chat.contact) || null; } catch (e) { contact = null; }
+            if (!contact && nameColl) {
+                try {
+                    var cid = chat && chat.id;
+                    var key = (cid && cid._serialized) || cid;
+                    if (key) contact = nameColl.get(String(key));
+                } catch (e) { contact = null; }
+            }
+            var resolved = contactDisplayName(contact);
+            return resolved || name;
+        } catch (e) {
+            return String(rawName == null ? '' : rawName);
+        }
+    }
+
     // ── Method 1: WAWebChatCollection singleton ──────────────────────────
     try {
         const mod = window.require('WAWebChatCollection');
@@ -180,7 +298,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
         if (coll && typeof coll.getModelsArray === 'function') {
             return coll.getModelsArray().map(c => ({
                 id: c.id && c.id._serialized || String(c.id),
-                name: c.formattedTitle || c.name || '',
+                name: resolveChatName(c, c.formattedTitle || c.name || ''),
                 formattedTitle: c.formattedTitle || '',
                 isGroup: !!c.isGroup,
                 isPinned: !!(c.pin || c.isPinned),
@@ -202,7 +320,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
                 if (d && typeof d.getModelsArray === 'function') {
                     return d.getModelsArray().map(c => ({
                         id: c.id && c.id._serialized || String(c.id),
-                        name: c.formattedTitle || c.name || '',
+                        name: resolveChatName(c, c.formattedTitle || c.name || ''),
                         formattedTitle: c.formattedTitle || '',
                         isGroup: !!c.isGroup,
                         isPinned: !!(c.pin || c.isPinned),
@@ -242,7 +360,7 @@ function getAllChatsInPage(extractLastMessage, extractChatListRows) {
                             seen.add(chat.id._serialized);
                             results.push({
                                 id: chat.id._serialized,
-                                name: chat.formattedTitle || chat.name || '',
+                                name: resolveChatName(chat, chat.formattedTitle || chat.name || ''),
                                 formattedTitle: chat.formattedTitle || '',
                                 isGroup: !!chat.isGroup,
                                 isPinned: !!(chat.pin || chat.isPinned),
@@ -306,6 +424,9 @@ app.post('/api/getAllChats', async (req, res) => {
             'return (' + getAllChatsInPage.toString() + ')(' +
                 chatPreviewLib.extractLastMessage.toString() + ',' +
                 chatPreviewLib.extractChatListRows.toString() + ');'));
+        for (const c of chats) {
+            if (!c.isGroup && chatPreviewLib.isGroupChat(c)) c.isGroup = true;
+        }
         const withPreview = chats.filter(c => c.lastMessage && c.lastMessage.body).length;
         console.log(`getAllChats: returned ${chats.length} chats (${withPreview} with preview)`);
         res.json({ response: chats });
@@ -333,6 +454,41 @@ app.post('/api/togglePinChat', (req, res) => {
     if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
     try {
         const updated = pinsLib.togglePin(chatId);
+        res.json({ response: updated });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── getArchivedChats ────────────────────────────────────────────────────────
+app.all('/api/getArchivedChats', (_req, res) => {
+    try {
+        const archived = archivesLib.getArchived();
+        res.json({ response: archived });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── setChatArchived ─────────────────────────────────────────────────────────
+app.post('/api/setChatArchived', (req, res) => {
+    const body = req.body || {};
+    const args = body.args || body;
+    const chatId = args.chatId || args.id;
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+    const raw = args.archived;
+    let archived;
+    if (raw === undefined) {
+        archived = true;
+    } else if (raw === true || raw === 1 || raw === 'true' || raw === '1') {
+        archived = true;
+    } else if (raw === false || raw === 0 || raw === 'false' || raw === '0') {
+        archived = false;
+    } else {
+        return res.status(400).json({ error: 'Invalid archived flag' });
+    }
+    try {
+        const updated = archivesLib.setArchived(chatId, archived);
         res.json({ response: updated });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -511,6 +667,56 @@ app.post('/api/getChatMessages', async (req, res) => {
                 chat = chatMod.get(cid);
             }
 
+            // ── Contact collection for sender resolution ─────────────────────
+            // Current WA builds leave msg.sender null; the sender's LID sits
+            // in msg.author and resolves to a display name through here.
+            let contactColl = null;
+            try {
+                if (typeof window.require !== 'undefined') {
+                    const contactMod = window.require('WAWebContactCollection');
+                    const cc = contactMod.ContactCollection || contactMod.ContactCollectionImpl;
+                    if (cc && typeof cc.get === 'function') contactColl = cc;
+                }
+            } catch (e) { }
+
+            // One sender-name rule for every extraction site below: legacy
+            // sender model first, then author-LID contact lookup, then the
+            // phone-number fallback. Never throws (the page must not die).
+            function resolveSenderName(sender, author) {
+                try {
+                    if (sender && typeof sender === 'object') {
+                        const direct = sender.formattedTitle || sender.pushname || sender.formattedName ||
+                            sender.name || sender.shortName || sender.notifyName ||
+                            ((sender.id && sender.id.user) || '');
+                        if (direct) return direct;
+                    }
+                    let authorId = '';
+                    if (typeof author === 'string') authorId = author;
+                    else if (author && typeof author === 'object') {
+                        authorId = author._serialized || author.user || '';
+                    }
+                    authorId = String(authorId || '');
+                    if (authorId && contactColl) {
+                        try {
+                            const contact = contactColl.get(authorId);
+                            if (contact) {
+                                const named = contact.pushname || contact.verifiedName ||
+                                    contact.formattedName || contact.name || contact.shortName || '';
+                                if (named) return named;
+                            }
+                        } catch (e) { }
+                    }
+                    if (authorId) {
+                        const at = authorId.indexOf('@');
+                        const domain = at !== -1 ? authorId.substring(at + 1) : '';
+                        if (domain === 'c.us' || domain === 's.whatsapp.net') {
+                            return authorId.substring(0, at);
+                        }
+                    }
+                } catch (e) { }
+                return '';
+            }
+
             // Select the chat to make sure messages are loaded
             let selectedViaDOM = false;
             if (!alreadyOpen) {
@@ -569,31 +775,28 @@ app.post('/api/getChatMessages', async (req, res) => {
             if (chat && chat.msgs && typeof chat.msgs.getModelsArray === 'function') {
                 try {
                     msgs = chat.msgs.getModelsArray().map(m => {
-                        let senderName = '';
-                        if (m.sender) {
-                            senderName = m.sender.formattedName || m.sender.name || m.sender.id.user || '';
-                        }
+                        const senderName = resolveSenderName(m.sender, m.author || m.participant);
                         // Collect reactions if present.
-                        // WA's reaction model exposes the emoji under `orphan`
-                        // (aggregation key) or `emoji`; `sent_by_me` and the
-                        // MaybeMeUser comparison give a reliable `fromMe`.
-                        let reactions = [];
-                        try {
-                            if (m.reactions && m.reactions.length > 0) {
-                                const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
-                                reactions = m.reactions.map(r => {
-                                    const emoji = r.orphan || r.emoji || r.reactionText || '';
-                                    let fromMe = !!r.sent_by_me;
-                                    try {
-                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
-                                        if (me && sid) fromMe = fromMe || String(sid) === me;
-                                    } catch (_) { }
-                                    return {
-                                        emoji: emoji,
-                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
-                                        fromMe: fromMe,
-                                    };
-                                }).filter(r => r.emoji);
+                                // WA's reaction model exposes the emoji under `orphan`
+                                // (aggregation key) or `emoji`; `sent_by_me` and the
+                                // MaybeMeUser comparison give a reliable `fromMe`.
+                                let reactions = [];
+                                try {
+                                    if (m.reactions && m.reactions.length > 0) {
+                                        const me = window.Store && window.Store.MaybeMeUser ? String(window.Store.MaybeMeUser) : '';
+                                        reactions = m.reactions.map(r => {
+                                            const emoji = r.orphan || r.emoji || r.reactionText || '';
+                                            let fromMe = !!r.sent_by_me;
+                                            try {
+                                                const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                                if (me && sid) fromMe = fromMe || String(sid) === me;
+                                            } catch (_) { }
+                                            return {
+                                                emoji: emoji,
+                                                sender: resolveSenderName(r.sender, null),
+                                                fromMe: fromMe,
+                                            };
+                                        }).filter(r => r.emoji);
                             }
                         } catch (_) { }
                         // Extract quoted (replied-to) message if present
@@ -601,9 +804,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                         try {
                             const qm = m.quotedMsg || (m.quotedStanzaInfo && m.quotedStanzaInfo.quotedMsg);
                             if (qm) {
-                                let qSender = '';
-                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
-                                else if (m.quotedParticipant) qSender = m.quotedParticipant.user || String(m.quotedParticipant) || '';
+                                let qSender = resolveSenderName(qm.sender, qm.author);
+                                if (!qSender && m.quotedParticipant) qSender = m.quotedParticipant.user || String(m.quotedParticipant) || '';
                                 quotedMsg = {
                                     body: qm.body || qm.content || qm.caption || '',
                                     type: qm.type || 'chat',
@@ -614,7 +816,11 @@ app.post('/api/getChatMessages', async (req, res) => {
                         return {
                             id: m.id && m.id._serialized || String(m.id || Math.random()),
                             body: m.body || m.content || '',
+                            caption: m.caption || '',
+                            waveform: Array.isArray(m.waveform) ? Array.from(m.waveform).slice(0, 128) : [],
+                            duration: Number(m.duration) > 0 ? Math.floor(Number(m.duration)) : 0,
                             type: m.type || 'chat',
+                            subtype: m.subtype || '',
                             t: m.t || 0,
                             fromMe: !!(m.id && m.id.fromMe),
                             senderName: senderName,
@@ -644,13 +850,10 @@ app.post('/api/getChatMessages', async (req, res) => {
                                 seen.add(f); depth++;
                                 const props = f.memoizedProps;
                                 if (props) {
-                                    const msg = props.message || props.msg;
-                                    if (msg && msg.id && msg.id._serialized && !seen.has(msg.id._serialized)) {
-                                        seen.add(msg.id._serialized);
-                                        let senderName = '';
-                                        if (msg.sender) {
-                                            senderName = msg.sender.formattedName || msg.sender.name || msg.sender.id.user || '';
-                                        }
+                                        const msg = props.message || props.msg;
+                                        if (msg && msg.id && msg.id._serialized && !seen.has(msg.id._serialized)) {
+                                            seen.add(msg.id._serialized);
+                                            const senderName = resolveSenderName(msg.sender, msg.author || msg.participant);
                                         // Collect reactions (same rules as Method A).
                                         let reactions = [];
                                         try {
@@ -665,7 +868,7 @@ app.post('/api/getChatMessages', async (req, res) => {
                                                     } catch (_) { }
                                                     return {
                                                         emoji: emoji,
-                                                        sender: r.sender && (r.sender.formattedName || r.sender.name || r.sender.id.user || ''),
+                                                        sender: resolveSenderName(r.sender, null),
                                                         fromMe: fromMe,
                                                     };
                                                 }).filter(r => r.emoji);
@@ -676,9 +879,8 @@ app.post('/api/getChatMessages', async (req, res) => {
                                         try {
                                             const qm = msg.quotedMsg || (msg.quotedStanzaInfo && msg.quotedStanzaInfo.quotedMsg);
                                             if (qm) {
-                                                let qSender = '';
-                                                if (qm.sender) qSender = qm.sender.formattedName || qm.sender.name || (qm.sender.id && qm.sender.id.user) || '';
-                                                else if (msg.quotedParticipant) qSender = msg.quotedParticipant.user || String(msg.quotedParticipant) || '';
+                                                let qSender = resolveSenderName(qm.sender, qm.author);
+                                                if (!qSender && msg.quotedParticipant) qSender = msg.quotedParticipant.user || String(msg.quotedParticipant) || '';
                                                 quotedMsg = {
                                                     body: qm.body || qm.content || qm.caption || '',
                                                     type: qm.type || 'chat',
@@ -689,7 +891,11 @@ app.post('/api/getChatMessages', async (req, res) => {
                                         results.push({
                                             id: msg.id._serialized,
                                             body: msg.body || msg.content || '',
+                                            caption: msg.caption || '',
+                                            waveform: Array.isArray(msg.waveform) ? Array.from(msg.waveform).slice(0, 128) : [],
+                                            duration: Number(msg.duration) > 0 ? Math.floor(Number(msg.duration)) : 0,
                                             type: msg.type || 'chat',
+                                            subtype: msg.subtype || '',
                                             t: msg.t || 0,
                                             fromMe: !!(msg.id && msg.id.fromMe),
                                             senderName: senderName,
@@ -714,6 +920,19 @@ app.post('/api/getChatMessages', async (req, res) => {
 
             // Method C: DOM scraping of main pane (final fallback)
             if (msgs.length <= 1) {
+                // Reactions scraped above (A/B) keyed by id plus a t::body
+                // fallback: DOM rows below get synthetic dom_msg_N ids, so an
+                // id-only map would never match. C only fires when
+                // msgs.length<=1, so fallback-key collision risk is negligible.
+                const priorRx = {};
+                try {
+                    for (const m of msgs) {
+                        if (m && Array.isArray(m.reactions) && m.reactions.length) {
+                            if (m.id != null) priorRx[String(m.id)] = m.reactions;
+                            priorRx['t::' + (m.t || 0) + '::' + (m.body || '')] = m.reactions;
+                        }
+                    }
+                } catch (_) { }
                 try {
                     const messageEls = document.querySelectorAll('#main [data-pre-plain-text], #main .message-in, #main .message-out');
                     if (messageEls.length > 0) {
@@ -737,6 +956,16 @@ app.post('/api/getChatMessages', async (req, res) => {
                             }
                         });
                         if (results.length > msgs.length) {
+                            // REQ-005/AC-005: never emit silent empty reactions where
+                            // A/B had them — carry over on id match or t::body
+                            // fallback-key match (extra DOM latency here is
+                            // acceptable per spec).
+                            for (const r of results) {
+                                if (!r.reactions || r.reactions.length === 0) {
+                                    const hit = priorRx[r.id] || priorRx['t::' + (r.t || 0) + '::' + (r.body || '')];
+                                    if (hit && hit.length) r.reactions = hit;
+                                }
+                            }
                             msgs = results;
                         }
                     }
@@ -762,7 +991,11 @@ app.post('/api/getChatMessages', async (req, res) => {
                 const p = messagesLib.paginateMessages(cached.messages, pageArgs);
                 return res.json({ response: p.page, sig: cached.sig, hasMore: p.hasMore });
             }
-            const out = since ? messagesLib.filterMessagesSince(cached.messages, since) : cached.messages;
+            // Reaction union on the hit path too: an interleaving scrape (e.g.
+            // scroll-up pagination) may have advanced the cache past the
+            // client's since while dropping touched rows. Redelivery is
+            // idempotent via merge-by-id.
+            const out = since ? applySinceWithReactions(cached.messages, since, cached.prev || []) : cached.messages;
             return res.json({ response: out, sig: cached.sig });
         }
 
@@ -770,14 +1003,15 @@ app.post('/api/getChatMessages', async (req, res) => {
 
         // Cap payload size and compute a cheap change signature.
         if (messages.length > MSG_CACHE_MAX) messages = messages.slice(-MSG_CACHE_MAX);
-        const lastMsg = messages.length ? messages[messages.length - 1] : {};
-        const sig = messages.length + ':' + (lastMsg.id || '') + ':' + (lastMsg.t || 0);
-        msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages });
+        const prevEntry = msgCache.get(chatId);
+        const prevMessages = prevEntry ? prevEntry.messages : null;
+        const sig = computeMsgSig(messages);
+        msgCache.set(chatId, { t: Date.now(), sig: sig, messages: messages, prev: prevMessages });
         if (pageArgs && !since) {
             const p = messagesLib.paginateMessages(messages, pageArgs);
             return res.json({ response: p.page, sig: sig, hasMore: p.hasMore });
         }
-        const out = since ? messagesLib.filterMessagesSince(messages, since) : messages;
+        const out = since ? applySinceWithReactions(messages, since, prevMessages) : messages;
         res.json({ response: out, sig: sig });
     } catch (e) {
         console.error('getChatMessages error:', e.message);
@@ -803,6 +1037,8 @@ app.post('/api/waitMessages', async (req, res) => {
         const out = await waitForSigChange({
             getSig: async function () {
                 const cached = msgCache.get(chatId);
+                // Probe shortcut stays by design: bounded <=TTL delay, while
+                // bypassing it would add a constant in-page evaluate load.
                 if (cached && (Date.now() - cached.t) < MSG_CACHE_TTL_MS) return cached.sig;
                 // Cheap probe: signature only, no full message extraction.
                 return await waPage.evaluate((cid) => {
@@ -823,7 +1059,37 @@ app.post('/api/waitMessages', async (req, res) => {
                         const arr = typeof chat.msgs.getModelsArray === 'function' ? chat.msgs.getModelsArray() : [];
                         const last = arr.length ? arr[arr.length - 1] : {};
                         const lid = last.id && last.id._serialized || last.id || '';
-                        return arr.length + ':' + lid + ':' + (last.t || 0);
+                        // sig format: len:lastId:lastT:rxCount:rxMarkers (must match computeMsgSig in Node).
+                        let rxCount = 0;
+                        const rxParts = [];
+                        try {
+                            const me = (window.Store && window.Store.MaybeMeUser) ? String(window.Store.MaybeMeUser) : '';
+                            // Same .map-over-entries pattern Methods A/B use: safe
+                            // for Array and Backbone-style collections (no positional indexing).
+                            const asArray = function (rs) {
+                                return Array.isArray(rs) ? rs : rs.map(function (x) { return x; });
+                            };
+                            for (let i = 0; i < arr.length; i++) {
+                                const rs = arr[i] && arr[i].reactions;
+                                if (!rs || !rs.length) continue;
+                                const marks = asArray(rs).map(function (r) {
+                                    const emo = r.orphan || r.emoji || r.reactionText || '';
+                                    if (!emo) return '';
+                                    let mine = !!r.sent_by_me;
+                                    try {
+                                        const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                        if (me && sid) mine = mine || String(sid) === me;
+                                    } catch (_) { }
+                                    return emo + ':' + (mine ? '1' : '0');
+                                });
+                                for (let k = 0; k < marks.length; k++) {
+                                    if (!marks[k]) continue;
+                                    rxCount++;
+                                    rxParts.push(marks[k]);
+                                }
+                            }
+                        } catch (_) { }
+                        return arr.length + ':' + lid + ':' + (last.t || 0) + ':' + rxCount + ':' + rxParts.join(',');
                     } catch (e) { return ''; }
                 }, chatId);
             },
@@ -898,6 +1164,150 @@ app.get('/api/avatar/:hash', (req, res) => {
     res.set('Content-Type', isPng ? 'image/png' : 'image/jpeg');
     res.set('Cache-Control', 'private, max-age=86400, immutable');
     res.send(buf);
+});
+
+// ── getMedia (on-demand image bytes, downscaled in-page) ───────────────────
+// POST /api/getMedia { chatId, msgId, maxEdge } →
+//   { response: { dataUrl, width, height } }.
+// maxEdge=480 caps the longest edge at 480px; maxEdge=0 is full resolution.
+// Served from a ~30MB server-side LRU (key chatId|msgId|maxEdge).
+// Errors: 400 missing params, 404 msg not loaded, 502 download failed,
+// 503 backend not ready. In-page fn is toString-injected (this
+// puppeteer-core build does not forward page.evaluate args), so it must
+// stay fully self-contained — see lib/media.js getMediaInPage.
+// ── Shared media fetch (used by /api/getMedia + /api/openExternally) ───────
+// Returns { dataUrl, width, height } (full-res when maxEdge=0), using the
+// server-side LRU to avoid re-downloads. Throws an Error with .status set
+// (503 not ready, 404 msg not loaded, 502 download failed) so routes can
+// map it directly to HTTP. Cache behaviour matches the original getMedia.
+async function getMediaDataUrl(chatId, msgId, maxEdge) {
+    const page = await getValidPage();
+    if (!isReady || !page) {
+        const e = new Error('Not ready');
+        e.status = 503;
+        throw e;
+    }
+
+    const key = mediaLib.cacheKey(chatId, msgId, maxEdge);
+    const hit = mediaLib.mediaCache.get(key);
+    if (hit && hit.dataUrl) {
+        return { dataUrl: hit.dataUrl, width: hit.width, height: hit.height };
+    }
+
+    // Inject args as a JSON literal — page.evaluate args arrive
+    // undefined in this build, so the in-page fn takes none.
+    const payload = JSON.stringify({ chatId: chatId, msgId: msgId, maxEdge: maxEdge });
+    const src = '(' + mediaLib.getMediaInPage.toString() + ')(' + payload + ');';
+    let result;
+    try {
+        result = await Promise.race([
+            page.evaluate(new Function('return ' + src)),
+            new Promise(function (_, reject) {
+                setTimeout(function () { reject(new Error('getMedia timed out')); }, 30000);
+            }),
+        ]);
+    } catch (e) {
+        const err = new Error('Media download failed');
+        err.status = 502;
+        err.detail = String((e && e.message) || e);
+        throw err;
+    }
+
+    if (!result || result.error) {
+        const detail = result && result.error ? String(result.error) : 'empty result';
+        const err = new Error(detail.indexOf('NOT_FOUND') === 0
+            ? 'Message not loaded: ' + detail
+            : 'Media download failed: ' + detail);
+        err.status = detail.indexOf('NOT_FOUND') === 0 ? 404 : 502;
+        err.detail = detail;
+        throw err;
+    }
+    if (!result.dataUrl) {
+        const err = new Error('Media download failed: empty result');
+        err.status = 502;
+        err.detail = 'empty result';
+        throw err;
+    }
+
+    mediaLib.mediaCache.put(key, {
+        dataUrl: result.dataUrl,
+        width: result.width,
+        height: result.height,
+    });
+    return { dataUrl: result.dataUrl, width: result.width, height: result.height };
+}
+
+function mediaHttpStatus(e) {
+    const s = e && e.status;
+    if (s === 503 || s === 404 || s === 502 || s === 400) return s;
+    if (e && /timed out/.test(String(e.message || ''))) return 502;
+    return 500;
+}
+
+app.post('/api/getMedia', async (req, res) => {
+    const parsed = mediaLib.parseMediaArgs(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    try {
+        const out = await getMediaDataUrl(parsed.chatId, parsed.msgId, parsed.maxEdge);
+        res.json({ response: { dataUrl: out.dataUrl, width: out.width, height: out.height } });
+    } catch (e) {
+        const msg = String((e && e.message) || e);
+        const status = mediaHttpStatus(e);
+        if (status !== 500) return res.status(status).json({ error: msg });
+        console.error('getMedia error:', msg);
+        res.status(500).json({ error: msg });
+    }
+});
+
+// ── openExternally: full-res media → temp file → system viewer via xdg-open ─
+// POST /api/openExternally { chatId, msgId } → { response: { path } }.
+// Full-res (maxEdge 0) via the shared helper (LRU hit avoids re-download).
+// Errors: 400 missing params; 404/502/503 passthrough from media fetch;
+// 500 with detail when temp-file write or xdg-open spawn fails.
+app.post('/api/openExternally', async (req, res) => {
+    const parsed = mediaLib.parseOpenArgs(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    let data;
+    try {
+        data = await getMediaDataUrl(parsed.chatId, parsed.msgId, 0);
+    } catch (e) {
+        const msg = String((e && e.message) || e);
+        const status = mediaHttpStatus(e);
+        if (status !== 500) return res.status(status).json({ error: msg });
+        console.error('openExternally error:', msg);
+        return res.status(500).json({ error: msg });
+    }
+
+    const m = /^data:([a-z]+\/[a-z0-9.+-]+);base64,(.+)$/.exec(String(data.dataUrl || ''));
+    if (!m) {
+        return res.status(500).json({ error: 'Unexpected media encoding', detail: 'expected dataUrl' });
+    }
+    const extFor = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'video/mp4': 'mp4' };
+    const ext = extFor[String(m[1]).toLowerCase().split(';')[0]] || 'bin';
+    let buf;
+    try {
+        buf = Buffer.from(m[2], 'base64');
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not decode media', detail: String((e && e.message) || e) });
+    }
+    const safe = mediaLib.sanitizeMsgId(parsed.msgId);
+    const file = path.join(os.tmpdir(), 'whatsapp-kde-media-' + safe + '.' + ext);
+    try {
+        fs.writeFileSync(file, buf);
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not write temp file', detail: String((e && e.message) || e) });
+    }
+    try {
+        const { spawn } = require('child_process');
+        const child = spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
+        child.on('error', (err) => console.error('openExternally spawn error:', err.message));
+        child.unref();
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not open system viewer', detail: String((e && e.message) || e) });
+    }
+    res.json({ response: { path: file } });
 });
 
 // ── QR code bytes (GET, key via query so QML Image can pass ?key=) ──────────
@@ -998,6 +1408,9 @@ app.post('/api/sendReaction', async (req, res) => {
                             } catch (_) { }
                         }
                     }]);
+                    if (!reactionMod && typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 1: webpack scan matched nothing, falling through');
+                    }
                 }
 
                 // Find the Message collection to get the message object
@@ -1047,19 +1460,25 @@ app.post('/api/sendReaction', async (req, res) => {
                     }
                 }
 
+                if (!msg && typeof console !== 'undefined' && console.debug) {
+                    console.debug('sendReaction Method 1: message not found in collections, falling through');
+                }
                 if (msg) {
                     if (typeof msg.sendReaction === 'function') {
                         await msg.sendReaction(emoji, isRemove);
-                        return 'reacted';
+                        return 'M1';
                     }
                     // Try the reaction module
                     if (reactionMod && typeof reactionMod === 'function') {
                         await reactionMod(msg, emoji, isRemove);
-                        return 'reacted';
+                        return 'M1';
+                    }
+                    if (typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 1: no sendReaction affordance on message, falling through');
                     }
                 }
             } catch (e) {
-                console.log('sendReaction Method 1 failed:', e.message);
+                console.log('sendReaction Method 1 failed');
             }
 
             // ── Method 2: DOM interaction ─────────────────────────────────────
@@ -1081,7 +1500,28 @@ app.post('/api/sendReaction', async (req, res) => {
                     }
                 }
 
-                if (msgEl) {
+                if (msgEl && isRemove) {
+                    // Toggle-off (REQ-003): click the existing own-reaction chip
+                    // instead of opening the picker (which would re-add). When the
+                    // DOM offers no remove affordance, fall through to M3 — never
+                    // silently add on a remove request.
+                    let removed = false;
+                    try {
+                        const chip = msgEl.querySelector('[data-testid*="reaction"]') ||
+                            msgEl.querySelector('.reaction-chip') ||
+                            msgEl.querySelector('span[data-icon*="reaction"]');
+                        if (chip) {
+                            chip.click();
+                            await new Promise(r => setTimeout(r, 300));
+                            removed = true;
+                        } else if (typeof console !== 'undefined' && console.debug) {
+                            console.debug('sendReaction Method 2: no remove affordance in DOM, falling through to M3');
+                        }
+                    } catch (_) { }
+                    if (removed) return 'M2';
+                }
+
+                if (msgEl && !isRemove) {
                     // Hover over the message to reveal the reaction button
                     msgEl.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                     await new Promise(r => setTimeout(r, 300));
@@ -1121,34 +1561,102 @@ app.post('/api/sendReaction', async (req, res) => {
                                 }
                             }
                         }
-                        return 'reacted_via_dom';
+                        return 'M2';
+                    } else if (typeof console !== 'undefined' && console.debug) {
+                        console.debug('sendReaction Method 2: reaction button not found, falling through');
                     }
+                } else if (!msgEl && typeof console !== 'undefined' && console.debug) {
+                    console.debug('sendReaction Method 2: message element not found, falling through');
                 }
             } catch (e) {
-                console.log('sendReaction Method 2 failed:', e.message);
+                console.log('sendReaction Method 2 failed');
+            }
+
+            // M3 verify helper: re-read the message's own-reaction entries
+            // (single lookup, same collection pattern M1 uses) and confirm the
+            // requested add/remove landed. Unverifiable (message not found)
+            // counts as success — only a confirmed mismatch fails.
+            async function verifyOwnReaction(tmid, temoji, twantRemove) {
+                try {
+                    let vmsg = null;
+                    if (typeof window.require !== 'undefined') {
+                        const vnames = ['WAWebMessageCollection', 'WAWebStore', 'Store'];
+                        for (const vn of vnames) {
+                            try {
+                                const vm = window.require(vn);
+                                const vcoll = vm.MessageCollection || vm.MsgCollection || (vm.default && (vm.default.Message || vm.default.Msg));
+                                if (vcoll && typeof vcoll.get === 'function') { vmsg = vcoll.get(tmid); break; }
+                            } catch (_) { }
+                        }
+                    }
+                    if (!vmsg) return true;
+                    const vrs = vmsg.reactions;
+                    if (!vrs) return !!twantRemove;
+                    try {
+                        const vme = (window.Store && window.Store.MaybeMeUser) ? String(window.Store.MaybeMeUser) : '';
+                        const list = Array.isArray(vrs) ? vrs : vrs.map(function (x) { return x; });
+                        let ownHas = false;
+                        const marks = list.map(function (r) {
+                            const e = r.orphan || r.emoji || r.reactionText || '';
+                            if (e !== temoji) return '';
+                            let mine = !!r.sent_by_me;
+                            try {
+                                const sid = r.sender && r.sender.id && r.sender.id._serialized;
+                                if (vme && sid) mine = mine || String(sid) === vme;
+                            } catch (_) { }
+                            return mine ? '1' : '';
+                        });
+                        for (let k = 0; k < marks.length; k++) {
+                            if (marks[k]) { ownHas = true; break; }
+                        }
+                        return twantRemove ? !ownHas : ownHas;
+                    } catch (_) { return true; }
+                } catch (_) { return true; }
             }
 
             // ── Method 3: Direct Store.react mutation ─────────────────────────
+            // REQ-003: forward isRemove (already plumbed as the 4th evaluate arg
+            // from the route handler) so toggle-off works here too.
             try {
                 // Use the WhatsApp webpack module for reacting
                 if (typeof window.require !== 'undefined') {
                     const Store = window.require('WAWebStore');
                     if (Store && Store.Msg && Store.Msg.react) {
-                        await Store.Msg.react(mid, emoji);
-                        return 'reacted';
+                        let done = false;
+                        try {
+                            await Store.Msg.react(mid, emoji, isRemove);
+                            done = await verifyOwnReaction(mid, emoji, isRemove);
+                            if (!done) {
+                                // Accepted but ignored the flag: alternate form once.
+                                await Store.Msg.react(mid, emoji, { remove: !!isRemove });
+                                done = await verifyOwnReaction(mid, emoji, isRemove);
+                            }
+                        } catch (_) {
+                            // Older builds take an options object for removal.
+                            await Store.Msg.react(mid, emoji, { remove: !!isRemove });
+                            done = await verifyOwnReaction(mid, emoji, isRemove);
+                        }
+                        if (!done) throw new Error('reaction not reflected');
+                        return 'M3';
                     }
                 }
             } catch (e) {
-                console.log('sendReaction Method 3 failed:', e.message);
+                console.log('sendReaction Method 3 failed');
             }
 
             throw new Error('Could not send reaction via any method');
         }, chatId, msgId, reaction, remove);
 
-        console.log(`sendReaction: reacted to ${msgId} with ${reaction}`);
-        res.json({ response: result || 'reacted' });
+        // AC-004/SEC-001: log only method + ok, never chat/message IDs, emoji, or payloads.
+        // Evaluate returns M1/M2/M3 only; response stays compat (reacted|reacted_via_dom).
+        const method = result || 'unknown';
+        console.log('sendReaction: ok method=' + method);
+        // GUD-001 cache-bust: a reaction changes messages without changing
+        // count/lastId/lastT, so drop the cached snapshot for a fresh scrape.
+        msgCache.delete(chatId);
+        res.json({ response: method === 'M2' ? 'reacted_via_dom' : 'reacted', method: method });
     } catch (e) {
-        console.error('sendReaction error:', e.message);
+        console.error('sendReaction error');
         res.status(500).json({ error: e.message });
     }
 });
@@ -1804,6 +2312,7 @@ app.post('/api/logout', async (_req, res) => {
         currentOpenChatId = null;
         msgCache.clear();
         avatarStore.clear();
+        mediaLib.mediaCache.clear();
         try { fs.unlinkSync(QR_PATH); } catch (_) { }
         if (waPage) {
             try {
@@ -1828,18 +2337,26 @@ async function launch() {
 
     fs.mkdirSync(DATA_DIR, { recursive: true });
 
-    // Clean up SingletonLock if it exists to prevent Chrome startup failures
-    const lockPath = path.join(DATA_DIR, 'SingletonLock');
-    if (fs.existsSync(lockPath)) {
-        try {
-            fs.unlinkSync(lockPath);
-            console.log('[HEAL] Removed leftover SingletonLock file.');
-        } catch (e) {
-            console.error('[HEAL] Failed to remove SingletonLock file:', e.message);
+    // Clean up stale Singleton files (Lock/Socket/Cookie) so Chrome can start.
+    // A lock left by a dead (or half-dead) instance otherwise aborts the launch
+    // with "Failed to create SingletonLock: File exists (17)".
+    const SINGLETON_FILES = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+    const clearSingletons = () => {
+        for (const f of SINGLETON_FILES) {
+            const p = path.join(DATA_DIR, f);
+            try {
+                if (fs.existsSync(p)) {
+                    fs.unlinkSync(p);
+                    console.log('[HEAL] Removed leftover ' + f + ' file.');
+                }
+            } catch (e) {
+                console.error('[HEAL] Failed to remove ' + f + ':', e.message);
+            }
         }
-    }
+    };
+    clearSingletons();
 
-    browser = await puppeteer.launch({
+    const launchOpts = {
         executablePath: CHROME,
         headless: true,
         userDataDir: DATA_DIR,
@@ -1851,7 +2368,21 @@ async function launch() {
             '--window-size=1280,800',
         ],
         defaultViewport: { width: 1280, height: 800 },
-    });
+    };
+
+    try {
+        browser = await puppeteer.launch(launchOpts);
+    } catch (e) {
+        // Chrome refused to start — usually a profile lock held by a half-dead
+        // instance that lost its CDP connection. Kill anything bound to this
+        // profile dir, clear the locks again, and retry exactly once.
+        console.error('[HEAL] Chrome launch failed:', e.message);
+        console.log('[HEAL] Killing stale chrome bound to this profile and retrying once…');
+        try { exec('pkill -f "' + DATA_DIR + '"'); } catch (_) { }
+        await new Promise(r => setTimeout(r, 2500));
+        clearSingletons();
+        browser = await puppeteer.launch(launchOpts);
+    }
 
     const pages = await browser.pages();
     waPage = pages[0] || await browser.newPage();

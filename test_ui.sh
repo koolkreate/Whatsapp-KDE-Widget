@@ -305,18 +305,43 @@ else
     fail "metadata.json not found"
 fi
 
-# Check that main.qml contains the quotedMsg UI
-if grep -q "quotedMsg" "$WIDGET_DIR/contents/ui/main.qml"; then
-    pass "main.qml contains quotedMsg reply UI"
+# Check that MessagesPanel.qml contains the quotedMsg UI
+# (moved out of main.qml in the Slice 7 MessagesPanel split)
+if grep -q "quotedMsg" "$WIDGET_DIR/contents/ui/MessagesPanel.qml"; then
+    pass "MessagesPanel.qml contains quotedMsg reply UI"
 else
-    fail "main.qml missing quotedMsg reply UI"
+    fail "MessagesPanel.qml missing quotedMsg reply UI"
 fi
 
-# Check that main.qml contains ensureCursorVisible (auto-scroll fix)
-if grep -q "ensureCursorVisible" "$WIDGET_DIR/contents/ui/main.qml"; then
-    pass "main.qml contains cursor auto-scroll fix"
+# Check that SendMessageBar.qml contains ensureCursorVisible (auto-scroll fix,
+# moved out of main.qml in the Slice 3 split)
+if grep -q "ensureCursorVisible" "$WIDGET_DIR/contents/ui/SendMessageBar.qml"; then
+    pass "SendMessageBar.qml contains cursor auto-scroll fix"
 else
-    fail "main.qml missing cursor auto-scroll fix"
+    fail "SendMessageBar.qml missing cursor auto-scroll fix"
+fi
+
+# QML compile gate (Slice 3 learning): a surviving plasmawindowed process does
+# NOT imply error-free QML — the error dialog keeps it alive. qmlscene fails
+# fast on alias/id/type errors instead. Headless qmlscene also prints
+# environment banners (deprecation notice, absent window/plasma plugins,
+# Qt-internal notes, FFmpeg banner, the driver's local-file XHR probe), so
+# those are filtered out while hard error patterns are matched explicitly —
+# the filter can never hide a real QML error.
+QMLSCENE_BIN="$(ls /usr/lib64/qt6/bin/qmlscene 2>/dev/null || command -v qmlscene 2>/dev/null || true)"
+if [ -n "$QMLSCENE_BIN" ]; then
+    QML_NOISE="qmlscene.deprecated|installEventFilter|kf.windowsystem|propertyCache.append|kf.plasma.quick|qt.multimedia.ffmpeg|XMLHttpRequest: Using GET on a local file|Set QML_XHR_ALLOW_FILE_READ|VDPAU|libva|iHD|/dri|PlasmoidAttached"
+    QML_RAW=$(timeout 15 env QT_QPA_PLATFORM=offscreen "$QMLSCENE_BIN" "$WIDGET_DIR/contents/ui/main.qml" 2>&1 || true)
+    QML_ERR=$(echo "$QML_RAW" | grep -vE "$QML_NOISE" | grep -vE "^[[:space:]]*$" || true)
+    QML_HARD=$(echo "$QML_RAW" | grep -aE "TypeError|ReferenceError|SyntaxError|is not a type|Unable to find id|Invalid alias|Cannot assign|Binding loop|File not found" || true)
+    if [ -z "$QML_ERR" ] && [ -z "$QML_HARD" ]; then
+        pass "main.qml loads with no QML errors (qmlscene)"
+    else
+        printf '%s\n%s\n' "$QML_HARD" "$QML_ERR" | grep -vE "^[[:space:]]*$" | head -n 10
+        fail "main.qml has QML errors (qmlscene)"
+    fi
+else
+    echo "  ⚠️  qmlscene not available, skipping QML compile gate"
 fi
 
 # Check widget is installed
@@ -324,6 +349,24 @@ if ls ~/.local/share/plasma/plasmoids/org.kde.whatsappquick/ >/dev/null 2>&1; th
     pass "Widget installed in plasmoids directory"
 else
     fail "Widget not found in plasmoids directory"
+fi
+
+# Installed-vs-repo parity (the upgrade path once dropped a new QML file
+# silently and every other check still passed — never again)
+INSTALLED_UI=~/.local/share/plasma/plasmoids/org.kde.whatsappquick/contents/ui
+if [ -d "$INSTALLED_UI" ]; then
+    MISSING=""
+    for f in "$WIDGET_DIR"/contents/ui/*.qml "$WIDGET_DIR"/contents/ui/*.js; do
+        base=$(basename "$f")
+        [ -f "$INSTALLED_UI/$base" ] || MISSING="$MISSING $base"
+    done
+    if [ -z "$MISSING" ]; then
+        pass "Installed package contains all QML/JS files"
+    else
+        fail "Installed package missing files:$MISSING (reinstall cleanly)"
+    fi
+else
+    fail "Installed ui directory not found"
 fi
 
 # ── 8. Backend unit tests ────────────────────────────────────────────────────
@@ -344,9 +387,28 @@ else
     fi
 fi
 
-# ── 9. Live widget launch (plasmawindowed) ───────────────────────────────────
+# ── 9. QML unit tests (qmltestrunner) ────────────────────────────────────────
 echo ""
-echo "── 9. Live widget in plasmawindowed ─────────────────────"
+echo "── 9. QML unit tests ────────────────────────────────────"
+QMLTEST_BIN="$(ls /usr/lib64/qt6/bin/qmltestrunner 2>/dev/null || command -v qmltestrunner 2>/dev/null || true)"
+TESTS_DIR="/home/kwame-t/projects/whatsapp-kde-widget/tests"
+if [ -n "$QMLTEST_BIN" ] && [ -d "$TESTS_DIR" ]; then
+    QMLTEST_OUT=$(cd /home/kwame-t/projects/whatsapp-kde-widget && QT_QPA_PLATFORM=offscreen "$QMLTEST_BIN" -input "$TESTS_DIR" 2>&1 || true)
+    QMLTEST_TOTALS=$(echo "$QMLTEST_OUT" | grep -oP 'Totals: \K\d+ passed, \d+ failed' || echo "")
+    QMLTEST_FAILS=$(echo "$QMLTEST_OUT" | grep -oP 'Totals: \d+ passed, \K\d+' || echo "1")
+    if [ "$QMLTEST_FAILS" = "0" ]; then
+        pass "All QML unit tests pass ($QMLTEST_TOTALS)"
+    else
+        echo "$QMLTEST_OUT" | grep -E 'FAIL!|Loc:' | head -n 10
+        fail "QML unit tests failed ($QMLTEST_TOTALS)"
+    fi
+else
+    echo "  ⚠️  qmltestrunner not available or tests/ directory missing, skipping"
+fi
+
+# ── 10. Live widget launch (plasmawindowed) ──────────────────────────────────
+echo ""
+echo "── 10. Live widget in plasmawindowed ────────────────────"
 # Launch the widget standalone for visual inspection
 PW_PID=""
 if command -v plasmawindowed &>/dev/null; then
@@ -362,6 +424,19 @@ if command -v plasmawindowed &>/dev/null; then
     # Check if it's still running (didn't crash)
     if kill -0 "$PW_PID" 2>/dev/null; then
         pass "Widget launched in plasmawindowed (PID $PW_PID) — no crash"
+
+        # Journal QML-error check: plasmawindowed logs QML errors to the
+        # journal, NOT stderr — a live process proves nothing on its own
+        # (an error dialog keeps it alive). Fail on binding loops, type
+        # errors, bad aliases/ids, or missing component files.
+        sleep 2
+        JQML_ERR=$(journalctl --user --since "2 minutes ago" 2>/dev/null | grep -aP "plasmawindowed.*(Binding loop|TypeError|ReferenceError|Cannot read property|Unable to find id|Invalid alias|is not a type|File not found)" | head -n 5 || true)
+        if [ -z "$JQML_ERR" ]; then
+            pass "No QML errors in journal (plasmawindowed)"
+        else
+            echo "$JQML_ERR"
+            fail "QML errors in journal (plasmawindowed)"
+        fi
 
         # Try to take a screenshot
         if command -v spectacle &>/dev/null; then

@@ -2,9 +2,10 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Effects
 import QtQuick.Controls
+import QtMultimedia
+import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components 3.0 as PlasmaComponents
-import QtQuick.Dialogs
 import "messageUtils.js" as MsgUtils
 import "pollingUtils.js" as PollUtils
 
@@ -47,13 +48,48 @@ PlasmoidItem {
     signal messageSent(bool success)
     property bool   emojiPickerVisible: false
     property string activeReactionMsgId: ""  // msg id for reaction popup
+    property var    reactionInFlight: ({})  // msgId -> true while a reaction POST is outstanding
+    property var    _reactionSnapshots: ({}) // msgId -> reactions[] before optimistic apply (rollback)
     property string pendingReplyId: ""     // msg id being replied to (quoted send)
     property string replyPreviewLabel: ""  // short preview shown in the quote bar
     property var    contextReplyMsg: null  // message that was right-clicked
     property var    contextChat: null      // chat that was right-clicked
     property var    pinnedChats: []        // list of pinned chat IDs
+    property var    archivedChats: []      // archived chat IDs
+    property bool   showArchived: false    // chat list is showing archived chats
     property string pendingAttachmentPath: "" // pasted image waiting to be sent
     property bool   copyToastVisible: false
+
+    // ── Agent test workflow (agent_test.sh) ──────────────────────────────────
+    // The driver (testDriver.js) is loaded dynamically on completion, and
+    // only activates when a test-config.json sits next to main.qml — a file
+    // that exists solely in the scratch widget package the test script
+    // builds. Normal installs have neither file, so this block is a no-op
+    // there. Never set these by hand.
+    property bool   testMode: false
+    property var    testCfg: null
+    property Item   msgListViewRef: null  // captured by the ListView on completion
+
+    // Reliable access to the messages ListView: the `messageListView` id lives
+    // in MessagesPanel.qml (Slice 7) and is not resolvable at root scope, so
+    // code that scrolls must go through this helper (backed by the
+    // `root.msgListViewRef` capture the ListView makes on completion).
+    function getMsgListView() {
+        if (root.msgListViewRef) return root.msgListViewRef;
+        return null;
+    }
+
+    Component.onCompleted: {
+        var driverHost = null;
+        try {
+            driverHost = Qt.createQmlObject(
+                'import QtQuick; import "testDriver.js" as TestDriver; QtObject { function start(r) { TestDriver.maybeStart(r); } }',
+                root, "TestDriverHost");
+        } catch (e) { driverHost = null; }
+        if (driverHost) {
+            try { driverHost.start(root); } catch (e) { }
+        }
+    }
 
     // ── Lazy-load + MRU cache + media viewer (Slices 2–4) ────────────────────
     property int    chatsShown: 20          // chat-list window size (scroll grows it)
@@ -65,6 +101,14 @@ PlasmoidItem {
     property bool   viewerVisible: false    // fullscreen media overlay
     property var    mediaList: []           // viewable media msgs of the open chat
     property int    mediaIndex: 0
+    property var    _thumbInflight: ({})    // msgId|maxEdge -> true (getMedia dedupe)
+    property bool   viewerFullLoading: false // full-res fetch in flight for viewer
+    property bool   viewerFullFailed: false // full-res fetch failed (retry cue)
+    property string viewerFullSource: ""    // dataUrl of the full-res viewer image
+    property string viewerFullMsgId: ""     // msg id the viewerFullSource belongs to
+    property string externalOpenToast: ""   // bubble-tap external open status/error toast
+    property string _pendingOpenChatId: ""  // cold open queued while a poll is in flight
+    property int    _waitGen: 0             // wait-loop generation (chat switches)
 
     function isChatPinned(chat) {
         if (!chat) return false;
@@ -75,6 +119,36 @@ PlasmoidItem {
             if (root.pinnedChats[i] === cid) return true;
         }
         return false;
+    }
+
+    function isChatArchived(chat) {
+        if (!chat) return false;
+        // The backend-provided archivedChats list is authoritative; stale
+        // per-chat object flags are ignored so unarchive always takes effect.
+        var cid = (typeof chat === "string") ? chat : (chat.id || "");
+        if (!cid || !root.archivedChats) return false;
+        for (var i = 0; i < root.archivedChats.length; i++) {
+            if (String(root.archivedChats[i]) === String(cid)) return true;
+        }
+        return false;
+    }
+
+    // Cross-file entry point for ChatListPanel's search field: QML ids are
+    // not properties, so panels cannot reach `searchDebounceTimer` directly.
+    function restartSearchDebounce() {
+        searchDebounceTimer.restart();
+    }
+
+    function recomputeTotalUnread() {
+        var u = 0;
+        if (root.allChats) {
+            for (var i = 0; i < root.allChats.length; i++) {
+                if (!root.isChatArchived(root.allChats[i])) {
+                    u += root.allChats[i].unreadCount || 0;
+                }
+            }
+        }
+        root.totalUnread = u;
     }
 
     function sortAndFilterChats() {
@@ -126,17 +200,75 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: { chatId: chatId } }));
     }
 
+    function fetchArchivedChats() {
+        if (!root.isConnected) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getArchivedChats");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.archivedChats = r.response || [];
+                    root.recomputeTotalUnread();
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: {} }));
+    }
+
+    function setChatArchived(chatId, archived) {
+        if (!root.isConnected || !chatId) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/setChatArchived");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.archivedChats = r.response || [];
+                    if (root.activeChat && String(root.activeChat.id) === String(chatId)
+                            && root.isChatArchived(chatId)) {
+                        root.activeChat = null;
+                    }
+                    if (root.showArchived && root.archivedChats.length === 0) {
+                        root.showArchived = false;
+                        root.chatsShown = 20;
+                    }
+                    root.recomputeTotalUnread();
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId, archived: archived } }));
+    }
+
     // Emoji-supporting font - use Noto Color Emoji if available, fallback to default
     readonly property string emojiFont: "Noto Color Emoji, emoji, monospace"
+
+    onMediaIndexChanged: {
+        if (viewerVisible) viewerLoadFull();
+    }
 
     onActiveChatChanged: {
         root.clearPendingReply();
         root.clearPendingAttachment();
+        root.scrollRestoreGen++;
         root.lastMsgSig = "";
         root.pollStreak = 0;
         root.pollsSinceFull = 0;
         root.msgsTopError = "";
+        root._pendingOlderFetch = "";
         if (activeChat !== null) {
+            root._waitGen++;
+            root.waitLoopRunning = false;
+            root._pendingOpenChatId = "";
+            root._pendingJumpEnd = true;
             root.mruTouch(activeChat.id);
             var cached = root.msgCache[activeChat.id];
             if (cached && cached.messages && cached.messages.length > 0) {
@@ -145,6 +277,7 @@ PlasmoidItem {
                 root.activeChatMessages = cached.messages;
                 root.msgsHasMore = true;
                 root.isLoadingMessages = false;
+                root.jumpToLatestPending();
                 fetchMessages(activeChat.id);
             } else {
                 root.activeChatMessages = [];
@@ -155,6 +288,7 @@ PlasmoidItem {
         } else {
             root.activeChatMessages = [];
             root.msgsHasMore = false;
+            root._pendingJumpEnd = false;
         }
     }
 
@@ -216,10 +350,14 @@ PlasmoidItem {
         else if (msg.type === "document") mediaLabel = "📄 Document";
         else if (msg.type === "sticker")  mediaLabel = "🪄 Sticker";
 
+        // System / non-renderable messages (call logs, deleted messages,
+        // group notices): show their emoji label instead of a blank preview.
         var body = msg.caption || msg.body || msg.content || "";
         var text;
         if (mediaLabel !== "") {
             text = body !== "" ? mediaLabel + " " + body : mediaLabel;
+        } else if (body === "" && MsgUtils.isSystemMessage(msg)) {
+            text = MsgUtils.systemMessageText(msg);
         } else {
             text = body;
         }
@@ -252,10 +390,10 @@ PlasmoidItem {
 
     function copyToClipboard(text) {
         if (!text) return;
-        clipTextEdit.text = text;
-        clipTextEdit.selectAll();
-        clipTextEdit.copy();
-        clipTextEdit.deselect();
+        contextMenuButtons.clipEdit.text = text;
+        contextMenuButtons.clipEdit.selectAll();
+        contextMenuButtons.clipEdit.copy();
+        contextMenuButtons.clipEdit.deselect();
         root.copyToastVisible = true;
         copyToastTimer.restart();
     }
@@ -279,6 +417,7 @@ PlasmoidItem {
                         root.hasQrCode = false;
                         root.statusMessage = "";
                         fetchPinnedChats();
+                        fetchArchivedChats();
                         fetchChats();
                     } else {
                         root.isConnected = false;
@@ -350,10 +489,9 @@ PlasmoidItem {
                     root.allChats = chats;
                     root.chatsShown = 20;
                     root.authFailStreak = 0;
-                    var u = 0;
-                    for (var i = 0; i < chats.length; i++) u += chats[i].unreadCount || 0;
-                    root.totalUnread = u;
+                    root.recomputeTotalUnread();
                     sortAndFilterChats();
+                    fetchArchivedChats(); // keep a second widget instance in sync
                     fetchAvatars();
                 } catch(e) {
                     console.log("Parse error:", e);
@@ -424,6 +562,7 @@ PlasmoidItem {
         if (!root.isConnected || root.activeChat === null || root.waitLoopRunning) return;
         root.waitLoopRunning = true;
         var chatId = root.activeChat.id;
+        var gen = root._waitGen;
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/waitMessages");
         xhr.setRequestHeader("Content-Type",  "application/json");
@@ -431,13 +570,20 @@ PlasmoidItem {
         xhr.timeout = 25000;
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (PollUtils.isStaleLoop(gen, root._waitGen)) return;
             root.waitLoopRunning = false;
             var changed = false;
             if (xhr.status === 200) {
                 try {
                     var r = JSON.parse(xhr.responseText);
                     changed = !!r.changed;
-                    if (r.sig && r.sig !== root.lastMsgSig) root.lastMsgSig = r.sig;
+                    // Only refresh the sig baseline on no-change timeouts.
+                    // When changed=true the sig must be left alone: the
+                    // follow-up fetch computes the same sig and would see
+                    // "sig === lastMsgSig" and SKIP the merge — messages
+                    // would silently never appear until a full refresh
+                    // (which then swaps the model and teleports the scroll).
+                    if (!changed && r.sig && r.sig !== root.lastMsgSig) root.lastMsgSig = r.sig;
                 } catch (e) { }
             }
             if (xhr.status === 200 && changed && root.activeChat && root.activeChat.id === chatId) {
@@ -464,7 +610,14 @@ PlasmoidItem {
     }
 
     function fetchMessages(chatId, background) {
-        if (!root.isConnected || !chatId || root.messagesInFlight) return;
+        if (!root.isConnected || !chatId) return;
+        if (root.messagesInFlight) {
+            if (PollUtils.shouldQueueColdOpen(true, background)) {
+                root._pendingOpenChatId = chatId;
+                root.isLoadingMessages = true;
+            }
+            return;
+        }
         root.messagesInFlight = true;
         if (!background) root.isLoadingMessages = true;
 
@@ -489,6 +642,37 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             root.messagesInFlight = false;
+            var pending = PollUtils.consumePendingOpen(root._pendingOpenChatId, root.activeChat ? root.activeChat.id : "");
+            root._pendingOpenChatId = "";
+            if (pending) {
+                fetchMessages(pending, false);
+                return;
+            }
+            // Drain a queued top-edge pagination that was blocked by an
+            // in-flight poll (its atYBeginningChanged trigger is gone).
+            // Guards: never refetch while a settle is re-pinning the view
+            // (anchorHold) — the previous prepend may have just landed and the
+            // view is still at the top only transiently; requeue instead and
+            // let a later poll decide once the restore has moved the view off
+            // the top. Cancel outright when the user scrolled away.
+            var pendingOlder = root._pendingOlderFetch;
+            if (pendingOlder && (!root.activeChat || root.activeChat.id !== pendingOlder)) {
+                root._pendingOlderFetch = "";
+            } else if (pendingOlder && root.msgsLoadingOlder) {
+                // still loading — keep queued
+            } else if (pendingOlder && !root.msgsHasMore) {
+                root._pendingOlderFetch = "";
+            } else if (pendingOlder && root.anchorHold) {
+                // keep queued — retry on a later poll
+            } else if (pendingOlder) {
+                var lvNow = root.getMsgListView();
+                if (lvNow && lvNow.atYBeginning) {
+                    root._pendingOlderFetch = "";
+                    fetchOlderMessages();
+                } else {
+                    root._pendingOlderFetch = "";
+                }
+            }
             // Discard responses for a chat that is no longer open — they must
             // never merge into another chat's view.
             if (root.activeChat === null || root.activeChat.id !== chatId) return;
@@ -502,33 +686,33 @@ PlasmoidItem {
                     if (background && sig === root.lastMsgSig) return;
                     root.lastMsgSig = sig;
                     root.pollStreak = 0;
-                    var wasAtEnd = (typeof messageListView !== "undefined" && messageListView && messageListView.atYEnd);
                     // Always merge against the LIVE list (not the snapshot
                     // taken at request time): an optimistic send may have
                     // appended a temp bubble while this request was in flight.
                     // settleMessages() preserves unconfirmed temp sends and
                     // drops temps the server has confirmed — no duplicates or
                     // vanishing bubbles when sends and incoming polls race.
+                    // applyMessagesModel() keeps the scroll position stable
+                    // across the model swap (follows the bottom only when the
+                    // user was already reading the latest messages).
                     if (useSince) {
                         root.pollsSinceFull++;
-                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        var mergedInc = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        root.applyMessagesModel(root.carryMediaUrls(root.activeChatMessages, mergedInc));
                     } else {
                         root.pollsSinceFull = 0;
-                        root.activeChatMessages = PollUtils.settleMessages(root.activeChatMessages, fresh);
-                        if (!background) root.msgsHasMore = (r.hasMore === true);
+                        var mergedFull = PollUtils.settleMessages(root.activeChatMessages, fresh);
+                        root.applyMessagesModel(root.carryMediaUrls(root.activeChatMessages, mergedFull));
+                        if (!background) {
+                            root.msgsHasMore = (r.hasMore === true);
+                            if (root.testMode) console.warn("WIDDBG hasMore-set: " + root.msgsHasMore +
+                                " background=" + background + " useSince=" + useSince +
+                                " fresh=" + fresh.length + " r.hasMore=" + r.hasMore);
+                        }
                     }
                     // Keep this chat's MRU cache copy fresh (thumbnailized).
                     if (root.activeChat && root.activeChat.id === chatId) {
                         root.mruStore(chatId, root.activeChatMessages, sig);
-                    }
-                    // Scroll to bottom after updating, but only when the user
-                    // was already reading the latest messages.
-                    if (wasAtEnd) {
-                        Qt.callLater(function() {
-                            if (typeof messageListView !== "undefined" && messageListView) {
-                                messageListView.positionViewAtEnd();
-                            }
-                        });
                     }
                 } catch(e) {
                     console.log("Parse messages error:", e);
@@ -545,12 +729,305 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: args }));
     }
 
+    // ── Scroll-stable model swap ──────────────────────────────────────────────
+    // The message model is a plain JS array, so every reassignment resets the
+    // ListView and the view can visibly jump ("teleport") — e.g. mid-swipe,
+    // when a background poll merge or a late thumbnail lands. This helper
+    // snapshots the scroll state first and restores it right after the swap:
+    //  - reading the latest messages (at the end, hands off the gestures) →
+    //    follow new messages to the bottom,
+    //  - anywhere else → re-pin the topmost visible bubble (by message id +
+    //    viewport offset), accurate even though contentHeight is partly
+    //    estimated for not-yet-instantiated delegates.
+    // swapInFlight marks the one-frame reset window: during it the ListView
+    // reports contentY=0 / atYBeginning=true spuriously, which must not
+    // auto-trigger top-edge pagination.
+    property bool swapInFlight: false
+    property int  scrollRestoreGen: 0   // supersedes in-flight scroll-restore loops
+    property bool anchorHold: false     // a scroll-restore settle is re-pinning the view
+    property string restoreMode: ""     // "end" | "anchor" | "" (no settle running)
+    property string restoreChat: ""     // chat id the running settle serves
+    property string _pendingOlderFetch: "" // older-page fetch queued behind an in-flight poll
+    // Set when a chat is (re)opened: the first payload — cold fetch or MRU
+    // cache paint — must land on the newest message, regardless of where the
+    // previous chat was left scrolled.
+    property bool _pendingJumpEnd: false
+
+    // Locate an instantiated message-bubble delegate by message id.
+    function findBubbleDelegateIn(item, msgId) {
+        if (!item) return null;
+        if (item.objectName === "msgBubbleDelegate" && item.testMsgId === msgId) return item;
+        var kids = item.children || [];
+        for (var i = 0; i < kids.length; i++) {
+            var hit = findBubbleDelegateIn(kids[i], msgId);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    function findBubbleDelegate(lv, msgId) {
+        if (!lv || !lv.contentItem) return null;
+        return findBubbleDelegateIn(lv.contentItem, msgId);
+    }
+
+    // Computed viewport edges. atYEnd/atYBeginning can latch stale
+    // values while contentHeight is still growing (async delegate
+    // heights), so arrival decisions use live numbers instead.
+    function isAtEnd(lv) {
+        if (!lv) return true;
+        try {
+            return lv.contentY >= lv.contentHeight - lv.height - 2;
+        } catch (e) { return true; }
+    }
+    function isAtBeginning(lv) {
+        if (!lv) return false;
+        try {
+            return lv.contentY <= 2;
+        } catch (e) { return false; }
+    }
+
+    // {id, off}: topmost visible bubble and how far below the viewport top
+    // its top edge sits (off = 0 when it is flush with the top).
+    function topVisibleAnchor(lv) {
+        var a = { id: "", off: 0 };
+        if (!lv || !lv.contentItem) return a;
+        var best = null, bestY = Infinity;
+        var stack = [lv.contentItem];
+        while (stack.length > 0) {
+            var it = stack.pop();
+            if (it.objectName === "msgBubbleDelegate") {
+                var y = it.mapToItem(lv.contentItem, 0, 0).y;
+                var h = it.height || 1;
+                if (y + h > lv.contentY + 10 && y < bestY && y + h > lv.contentY) {
+                    bestY = y; best = it;
+                }
+            }
+            var kids = it.children || [];
+            for (var i = 0; i < kids.length; i++) stack.push(kids[i]);
+        }
+        if (best) {
+            a.id = best.testMsgId;
+            a.off = Math.max(0, best.mapToItem(lv.contentItem, 0, 0).y - lv.contentY);
+        }
+        return a;
+    }
+
+    // Glue the view to the newest message for a few frames while the layout
+    // settles (delegate heights stream in asynchronously after a swap).
+    // Both settle loops set anchorHold while re-pinning. They exit early once
+    // the position sticks (assigned == observed before assigning) so they
+    // never fight user scrolls longer than necessary.
+    function releaseRestore(t) {
+        root.anchorHold = false;
+        root.restoreMode = "";
+        root.restoreChat = "";
+        try { t.stop(); } catch (e) {}
+        try { t.destroy(); } catch (e) {}
+        Qt.callLater(function() {
+            if (!root._pendingOlderFetch || !root.activeChat ||
+                root.activeChat.id !== root._pendingOlderFetch) {
+                root._pendingOlderFetch = "";
+                return;
+            }
+            var lv = root.getMsgListView();
+            if (!lv || !root.isAtBeginning(lv) || !root.msgsHasMore ||
+                root.msgsLoadingOlder || root.messagesInFlight || root.anchorHold) {
+                if (!lv || !root.isAtBeginning(lv)) root._pendingOlderFetch = "";
+                return;
+            }
+            root._pendingOlderFetch = "";
+            root.fetchOlderMessages();
+        });
+    }
+    // Land on the newest message once, right after a chat switch. Consumes the
+    // pending flag so later merges keep the user's reading position, and runs
+    // the end-settle loop (not a bare positionViewAtEnd) so the jump still
+    // wins when delegate heights are not final yet.
+    function jumpToLatestPending() {
+        if (!root._pendingJumpEnd) return;
+        root._pendingJumpEnd = false;
+        if (root.activeChatMessages.length === 0) return;
+        Qt.callLater(function() {
+            var lv = root.getMsgListView();
+            if (!lv || lv.count === 0) return;
+            root.restoreAtEndSettle(lv);
+        });
+    }
+
+    function restoreAtEndSettle(lv, retries) {
+        if (!lv) return;
+        retries = retries || 0;
+        root.scrollRestoreGen++;
+        var gen = root.scrollRestoreGen;
+        var idle = 0;
+        var total = 0;
+        var lastH = -1;
+        root.anchorHold = true;
+        root.restoreMode = "end";
+        root.restoreChat = root.activeChat ? String(root.activeChat.id) : "";
+        var t = Qt.createQmlObject(
+            "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
+            root, "ScrollEndTimer");
+        var retryLater = function() {
+            if (retries >= 4) return;
+            var rt = Qt.createQmlObject(
+                "import QtQuick; Timer { interval: 300; repeat: false; running: true }",
+                root, "ScrollEndRetryTimer");
+            rt.onTriggered.connect(function() {
+                try { rt.destroy(); } catch (e) {}
+                if (root.anchorHold || root.restoreMode !== "") return;
+                var ll = root.getMsgListView();
+                if (!ll) return;
+                if (root.isAtEnd(ll) && ll.contentHeight > ll.height) return;
+                if (ll.draggingVertically || ll.flickingVertically) return;
+                root.restoreAtEndSettle(ll, retries + 1);
+            });
+        };
+        t.onTriggered.connect(function() {
+            if (gen !== root.scrollRestoreGen) { root.releaseRestore(t); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.releaseRestore(t); return; }
+            total++;
+            if (total > 240) { root.releaseRestore(t); return; }
+            // Drive with a direct clamped assignment, not
+            // positionViewAtEnd(): issued in the same frame as a model
+            // reset, the method call can be swallowed while the ListView
+            // is still processing the new model.
+            var hNow = lv.contentHeight;
+            if (hNow <= 0) return;
+            var target = Math.max(0, hNow - lv.height);
+            var before = lv.contentY;
+            if (Math.abs(target - before) >= 0.5) lv.contentY = target;
+            // Exit only on genuine stillness: any height shift or real
+            // movement resets the idle count, so slow layouts keep
+            // converging instead of timing out mid-stream.
+            if (hNow !== lastH) { lastH = hNow; idle = 0; }
+            else if ((root.isAtEnd(lv) && hNow > lv.height) || Math.abs(lv.contentY - before) < 0.5) idle++;
+            else idle = 0;
+            if (idle >= 3) {
+                var arrived = root.isAtEnd(lv) && hNow > lv.height;
+                var short = hNow <= lv.height;
+                root.releaseRestore(t);
+                if (!arrived && !short) retryLater();
+            }
+        });
+        if (lv.contentHeight > 0) {
+            lv.contentY = Math.max(0, lv.contentHeight - lv.height);
+        }
+    }
+
+    // Re-pin the same bubble at the same viewport spot for a few frames;
+    // recomputed every tick so estimate shifts above the anchor are absorbed.
+    // While the anchor delegate is not yet instantiated, bootstrapY is used —
+    // for top-edge prepends pass the anchor's NEW index so the bootstrap can
+    // use positionViewAtIndex (arithmetic on unsettled contentHeight drifts
+    // and can strand the view at the top, re-triggering pagination).
+    function restoreAnchoredSettle(lv, anchor, prevY, bootstrapY, bootstrapIndex) {
+        if (!lv) return;
+        root.scrollRestoreGen++;
+        var gen = root.scrollRestoreGen;
+        var n = 0;
+        var stuck = 0;
+        root.anchorHold = true;
+        root.restoreMode = "anchor";
+        root.restoreChat = root.activeChat ? String(root.activeChat.id) : "";
+        var t = Qt.createQmlObject(
+            "import QtQuick; Timer { interval: 25; repeat: true; running: true }",
+            root, "ScrollAnchorTimer");
+        var pinY = function(y) { return Math.max(0, y); };
+        var bootstrap = function() {
+            if (bootstrapIndex !== undefined && bootstrapIndex !== null && bootstrapIndex >= 0) {
+                lv.positionViewAtIndex(bootstrapIndex, ListView.Beginning);
+            } else {
+                lv.contentY = pinY((bootstrapY !== undefined && bootstrapY !== null) ? bootstrapY : prevY);
+            }
+        };
+        t.onTriggered.connect(function() {
+            if (gen !== root.scrollRestoreGen || n > 24) { root.releaseRestore(t); return; }
+            if (lv.draggingVertically || lv.flickingVertically) { root.releaseRestore(t); return; }
+            n++;
+            var d = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
+            var before = lv.contentY;
+            if (d) {
+                lv.contentY = pinY(d.mapToItem(lv.contentItem, 0, 0).y - anchor.off);
+            } else {
+                bootstrap();
+            }
+            // Position stuck: re-pinning no longer changes anything — done.
+            if (Math.abs(lv.contentY - before) < 0.5) stuck++;
+            else stuck = 0;
+            if (stuck >= 3) { root.releaseRestore(t); }
+        });
+        var d0 = anchor.id ? root.findBubbleDelegate(lv, anchor.id) : null;
+        if (d0) lv.contentY = pinY(d0.mapToItem(lv.contentItem, 0, 0).y - anchor.off);
+        else bootstrap();
+    }
+
+    function applyMessagesModel(msgs) {
+        var lv = root.getMsgListView();
+        // A chat switch overrides the previous chat's scroll state: the first
+        // payload must land on the newest message.
+        var jumpEnd = root._pendingJumpEnd;
+        if (jumpEnd) root._pendingJumpEnd = false;
+        var userAtEnd = jumpEnd || (lv ? (root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically) : true);
+        var anchor = { id: "", off: 0 };
+        var prevY = 0;
+        if (lv) {
+            prevY = lv.contentY;
+            if (!userAtEnd) anchor = root.topVisibleAnchor(lv);
+        }
+        if (root.testMode) {
+            console.warn("WIDDBG swap: userAtEnd=" + userAtEnd + " atYEnd=" + (lv ? lv.atYEnd : "?") +
+                " prevY=" + prevY + " ch=" + (lv ? Math.round(lv.contentHeight) : "?") +
+                " h=" + (lv ? lv.height : "?") + " anchor=" + anchor.id +
+                " dragging=" + (lv ? lv.draggingVertically : "?") +
+                " flicking=" + (lv ? lv.flickingVertically : "?") +
+                " count=" + msgs.length);
+        }
+        root.swapInFlight = true;
+        root.activeChatMessages = msgs;
+        if (!lv) { root.swapInFlight = false; return; }
+        Qt.callLater(function() {
+            root.swapInFlight = false;
+            if (!lv || root.activeChatMessages !== msgs) return; // a newer merge took over
+            if (root.anchorHold && root.restoreMode !== "") {
+                var liveChat = root.activeChat ? String(root.activeChat.id) : "";
+                if (liveChat !== "" && liveChat === root.restoreChat) {
+                    return;
+                }
+                root.scrollRestoreGen++;
+                var liveAtEnd = root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically;
+                if (liveAtEnd) {
+                    root.restoreAtEndSettle(lv);
+                } else {
+                    root.restoreAnchoredSettle(lv, root.topVisibleAnchor(lv), lv.contentY);
+                }
+                return;
+            }
+            if (userAtEnd) {
+                root.restoreAtEndSettle(lv);
+            } else {
+                root.restoreAnchoredSettle(lv, anchor, prevY);
+            }
+        });
+    }
+
     // ── Top-edge pagination: load 20 older messages on scroll-up ─────────────
     function fetchOlderMessages() {
+        if (root.testMode) console.warn("WIDDBG prepend-run: hasMore=" + root.msgsHasMore +
+            " loading=" + root.msgsLoadingOlder + " inflight=" + root.messagesInFlight +
+            " y=" + (root.getMsgListView() ? Math.round(root.getMsgListView().contentY) : "?"));
         if (!root.isConnected || root.activeChat === null || root.msgsLoadingOlder || !root.msgsHasMore) return;
-        if (root.messagesInFlight) return; // serialize with background polls
+        if (root.messagesInFlight || root.anchorHold) {
+            // Serialize with background polls AND with running scroll
+            // restores: starting a second fetch while a restore is still
+            // re-pinning captures its anchor mid-churn and strands the
+            // view. Remember to retry once things settle.
+            root._pendingOlderFetch = root.activeChat.id;
+            return;
+        }
         var msgs = root.activeChatMessages;
         if (msgs.length === 0) return;
+        var lv = root.getMsgListView();
         var oldest = null;
         for (var i = 0; i < msgs.length; i++) {
             if (msgs[i] && msgs[i].id && String(msgs[i].id).indexOf("temp_") !== 0) { oldest = msgs[i]; break; }
@@ -558,6 +1035,11 @@ PlasmoidItem {
         if (!oldest) return;
 
         var chatId = root.activeChat.id;
+        // Capture the reading anchor NOW, at fetch start — the view is still
+        // exactly where the user left it. Waiting for the response risks a
+        // drifted view (another merge or settle may have re-pinned in between).
+        var anchor = lv ? root.topVisibleAnchor(lv) : { id: "", off: 0 };
+        var anchorPrevY = lv ? lv.contentY : 0;
         root.msgsLoadingOlder = true;
         root.msgsTopError = "";
         root.messagesInFlight = true;
@@ -578,16 +1060,47 @@ PlasmoidItem {
                     var older = r.response || [];
                     root.msgsHasMore = (r.hasMore === true);
                     if (older.length === 0) return;
-                    var oldH = (typeof messageListView !== "undefined" && messageListView) ? messageListView.contentHeight : 0;
-                    root.activeChatMessages = PollUtils.prependOlder(root.activeChatMessages, older);
-                    // Keep the visual anchor: shift by the height we added at
-                    // the top so the view doesn't jump.
-                    if (oldH > 0) {
-                        Qt.callLater(function() {
-                            if (typeof messageListView !== "undefined" && messageListView) {
-                                messageListView.contentY += messageListView.contentHeight - oldH;
-                            }
-                        });
+                    // The model swap resets the ListView; re-pin the bubble the
+                    // user was reading (captured at fetch start) at the same
+                    // viewport spot. Anchor-based, not contentHeight arithmetic
+                    // — contentHeight is partly estimated for delegates that
+                    // are not instantiated, so delta math drifts.
+                    var lv = root.getMsgListView();
+                    var newMsgs = PollUtils.prependOlder(root.activeChatMessages, older);
+                    root.swapInFlight = true; // suppress spurious atYBeginning triggers during the reset
+                    root.activeChatMessages = newMsgs;
+                    // Re-pin the same bubble at the same viewport spot for a
+                    // few frames while heights settle (see restoreAnchoredSettle).
+                    // Resolve the anchor to a message id up front; at run time
+                    // rebase it onto whatever model is live. A concurrent merge
+                    // (thumb landing, background poll) may replace the array
+                    // between response and layout — abandoning the restore
+                    // then strands the view wherever the reset dropped it.
+                    // With no identifiable anchor, fall back to the first
+                    // pre-existing item (it sits at older.length).
+                    var rebaseId = anchor.id;
+                    var rebaseOff = anchor.off || 0;
+                    if (!rebaseId && newMsgs.length > older.length) {
+                        var firstOld = newMsgs[older.length];
+                        if (firstOld && firstOld.id) rebaseId = String(firstOld.id);
+                    }
+                    if (lv && rebaseId) {
+                        (function(lvRef, wantId, wantOff) {
+                            Qt.callLater(function() {
+                                root.swapInFlight = false;
+                                if (!lvRef) return;
+                                var cur = root.activeChatMessages || [];
+                                var nk = -1;
+                                for (var i = 0; i < cur.length; i++) {
+                                    if (cur[i] && String(cur[i].id) === wantId) { nk = i; break; }
+                                }
+                                if (nk < 0) return; // anchor genuinely gone
+                                root.restoreAnchoredSettle(lvRef,
+                                    { id: wantId, off: wantOff }, anchorPrevY, -1, nk);
+                            });
+                        })(lv, rebaseId, rebaseOff);
+                    } else {
+                        root.swapInFlight = false;
                     }
                 } catch(e) {
                     root.msgsTopError = "Couldn't load older messages";
@@ -624,13 +1137,409 @@ PlasmoidItem {
         if (!chatId || !messages || messages.length === 0) return;
         var thumbs = [];
         for (var i = 0; i < messages.length; i++) {
-            thumbs.push(MsgUtils.thumbnailize(messages[i], 4096));
+            var t = MsgUtils.thumbnailize(messages[i], 4096);
+            // Persist thumbUrl on the placeholder copy so MRU-cached chats
+            // repaint 480p thumbs instantly (never strip it).
+            if (messages[i] && messages[i].thumbUrl && !t.thumbUrl) {
+                t.thumbUrl = messages[i].thumbUrl;
+            }
+            thumbs.push(t);
         }
         var next = {};
         for (var k in root.msgCache) next[k] = root.msgCache[k];
         next[chatId] = { messages: thumbs, sig: sig || "", savedAt: Date.now() };
         root.msgCache = next;
         root.mruTouch(chatId);
+    }
+
+    // ── 480p media thumbnails via POST /api/getMedia (Slices 2–3) ────────────
+    // Contract: POST {apiHost}/api/getMedia, headers Content-Type
+    // application/json + X-API-Key, body {args:{chatId,msgId,maxEdge}};
+    // success {response:{dataUrl,width,height}}; maxEdge 480 = thumb, 0 = full.
+    function fetchMedia(chatId, msgId, maxEdge, onDone) {
+        if (!root.isConnected || !chatId || !msgId) {
+            if (onDone) onDone("");
+            return;
+        }
+        var key = msgId + "|" + maxEdge;
+        if (root._thumbInflight[key]) return;
+        root._thumbInflight[key] = true;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getMedia");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            var next = {};
+            for (var k in root._thumbInflight) {
+                if (k !== key) next[k] = root._thumbInflight[k];
+            }
+            root._thumbInflight = next;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    var resp = r.response || {};
+                    var url = resp.dataUrl || "";
+                    if (onDone) onDone(url, resp.width || 0, resp.height || 0);
+                } catch(e) {
+                    if (onDone) onDone("");
+                }
+            } else {
+                if (onDone) onDone("");
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, maxEdge: maxEdge } }));
+    }
+
+    // Lazy 480p thumb for one bubble: fetch once when the delegate becomes
+    // visible, then write the dataUrl back onto the live message + MRU copy.
+    function requestThumb(msg) {
+        if (!msg || msg.thumbUrl) return;
+        var need = false;
+        try {
+            need = MsgUtils.needsThumb(msg);
+        } catch(e) {
+            return;
+        }
+        if (!need) return;
+        if (!root.activeChat || !msg.id) return;
+        var chatId = root.activeChat.id;
+        var mid = msg.id;
+        root.fetchMedia(chatId, mid, 480, function(url) {
+            if (!url) return;
+            root.applyThumbUrl(mid, url);
+        });
+    }
+
+    // Write a fetched thumbUrl back onto the live list (reassign to notify
+    // the ListView) and onto the MRU cached copy for instant repaint.
+    function applyThumbUrl(msgId, dataUrl) {
+        if (!msgId || !dataUrl) return;
+        var found = false;
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && msgs[i].id === msgId) {
+                msgs[i].thumbUrl = dataUrl;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+        // Reassign through the scroll-stable swap: a late thumbnail landing
+        // mid-scroll must not reset the ListView and yank the view.
+        root.applyMessagesModel(msgs.slice());
+        if (root.activeChat) {
+            var cid = root.activeChat.id;
+            var entry = root.msgCache[cid];
+            if (entry && entry.messages) {
+                for (var j = 0; j < entry.messages.length; j++) {
+                    if (entry.messages[j] && entry.messages[j].id === msgId) {
+                        entry.messages[j].thumbUrl = dataUrl;
+                        break;
+                    }
+                }
+                var next = {};
+                for (var k in root.msgCache) next[k] = root.msgCache[k];
+                root.msgCache = next;
+            }
+        }
+    }
+
+    // Carry cached thumbUrl/fullUrl across poll merges so a revalidate
+    // never blanks already-resolved 480p thumbs (poll payloads carry no
+    // media URLs). Pure overlay: message set, order and sort untouched.
+    function carryMediaUrls(oldMsgs, merged) {
+        if (!merged) return merged;
+        var cache = {};
+        for (var i = 0; i < (oldMsgs || []).length; i++) {
+            var o = oldMsgs[i];
+            if (o && o.id && (o.thumbUrl || o.fullUrl)) {
+                cache[o.id] = o;
+            }
+        }
+        for (var j = 0; j < merged.length; j++) {
+            var mm = merged[j];
+            if (mm && mm.id && cache[mm.id]) {
+                if (!mm.thumbUrl && cache[mm.id].thumbUrl) mm.thumbUrl = cache[mm.id].thumbUrl;
+                if (!mm.fullUrl && cache[mm.id].fullUrl) mm.fullUrl = cache[mm.id].fullUrl;
+            }
+        }
+        return merged;
+    }
+
+    // ── Voice-note / audio playback ────────────────────────────────────────
+    // One shared player for the whole widget: starting a second bubble
+    // stops the first, and bubble UI binds to root.audio* state.
+    property string audioPlayingMsgId: ""
+    property string audioPendingMsgId: ""
+    property string audioErrorMsgId: ""
+    property string audioError: ""
+    property bool audioIsPlaying: false
+    property int audioPositionMs: 0
+    property real audioSpeed: 1.0
+
+    MediaPlayer {
+        id: audioPlayer
+        audioOutput: AudioOutput { }
+        onPlaybackStateChanged: {
+            root.audioIsPlaying = (playbackState === MediaPlayer.PlayingState);
+            if (playbackState === MediaPlayer.StoppedState) root.audioPositionMs = 0;
+        }
+        onPositionChanged: { root.audioPositionMs = position; }
+        onErrorOccurred: function(error, errorString) {
+            root.audioError = errorString || "Couldn't play audio";
+            root.audioErrorMsgId = root.audioPlayingMsgId;
+            root.audioPlayingMsgId = "";
+            root.audioIsPlaying = false;
+            root.audioPendingMsgId = "";
+            audioErrorTimer.restart();
+        }
+    }
+
+    Timer {
+        id: audioErrorTimer
+        interval: 2500
+        repeat: false
+        running: false
+        onTriggered: { root.audioError = ""; root.audioErrorMsgId = ""; }
+    }
+
+    function audioSpeedLabel() {
+        if (root.audioSpeed >= 2.0) return "2x";
+        if (root.audioSpeed >= 1.5) return "1.5x";
+        return "1x";
+    }
+
+    function cycleAudioSpeed() {
+        if (root.audioSpeed >= 2.0) root.audioSpeed = 1.0;
+        else if (root.audioSpeed >= 1.5) root.audioSpeed = 2.0;
+        else root.audioSpeed = 1.5;
+        audioPlayer.playbackRate = root.audioSpeed;
+    }
+
+    // Fetch full audio bytes once, then write the dataUrl back onto the
+    // live message (+ MRU copy) so revalidations never refetch it.
+    function requestAudio(msg) {
+        if (!msg || msg.fullUrl) return;
+        if (!MsgUtils.isAudioMessage(msg)) return;
+        if (!root.activeChat || !msg.id) return;
+        var chatId = root.activeChat.id;
+        var mid = msg.id;
+        root.fetchMedia(chatId, mid, 0, function(url) {
+            if (!url) {
+                if (String(root.audioPendingMsgId) === String(mid)) {
+                    root.audioPendingMsgId = "";
+                    root.audioError = "Couldn't load audio";
+                    root.audioErrorMsgId = mid;
+                    audioErrorTimer.restart();
+                }
+                return;
+            }
+            root.applyFullUrl(mid, url);
+            if (String(root.audioPendingMsgId) === String(mid)) {
+                root.audioPendingMsgId = "";
+                audioPlayer.source = url;
+                audioPlayer.playbackRate = root.audioSpeed;
+                audioPlayer.play();
+            }
+        });
+    }
+
+    function applyFullUrl(msgId, dataUrl) {
+        if (!msgId || !dataUrl) return;
+        var found = false;
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === String(msgId)) {
+                msgs[i].fullUrl = dataUrl;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+        root.applyMessagesModel(msgs.slice());
+        if (root.activeChat) {
+            var cid = root.activeChat.id;
+            var entry = root.msgCache[cid];
+            if (entry && entry.messages) {
+                for (var j = 0; j < entry.messages.length; j++) {
+                    if (entry.messages[j] && String(entry.messages[j].id) === String(msgId)) {
+                        entry.messages[j].fullUrl = dataUrl;
+                        break;
+                    }
+                }
+                var next = {};
+                for (var k in root.msgCache) next[k] = root.msgCache[k];
+                root.msgCache = next;
+            }
+        }
+    }
+
+    function toggleAudioPlayback(msg) {
+        if (!msg || !msg.id) return;
+        var mid = msg.id;
+        if (String(root.audioPlayingMsgId) === String(mid) && root.audioIsPlaying) {
+            audioPlayer.pause();
+            return;
+        }
+        if (String(root.audioPlayingMsgId) === String(mid) && !root.audioIsPlaying) {
+            var resumeSrc = msg.fullUrl || "";
+            if (resumeSrc && String(audioPlayer.source) !== "") {
+                audioPlayer.playbackRate = root.audioSpeed;
+                audioPlayer.play();
+                return;
+            }
+        }
+        root.audioPlayingMsgId = mid;
+        root.audioPositionMs = 0;
+        root.audioError = "";
+        root.audioErrorMsgId = "";
+        var src = msg.fullUrl || "";
+        if (src) {
+            audioPlayer.source = src;
+            audioPlayer.playbackRate = root.audioSpeed;
+            audioPlayer.play();
+        } else {
+            root.audioPendingMsgId = mid;
+            audioPlayer.stop();
+            root.requestAudio(msg);
+        }
+    }
+
+    function stopAudio() {
+        audioPlayer.stop();
+        root.audioPlayingMsgId = "";
+        root.audioPositionMs = 0;
+        root.audioPendingMsgId = "";
+    }
+
+    function seekAudioFraction(frac, msgId) {
+        if (String(root.audioPlayingMsgId) !== String(msgId)) return;
+        var d = audioPlayer.duration || 0;
+        if (d <= 0) return;
+        var f = Math.min(1, Math.max(0, frac));
+        audioPlayer.position = Math.floor(f * d);
+    }
+
+    // ── Voice-note recording ───────────────────────────────────────────────
+    // Toggle flow, laptop-first: tap mic to record, tap again to stop into
+    // a draft (play / discard / send). Drafts send through the same
+    // sendFile path as pasted images, so the backend needs no new endpoint.
+    property string voiceState: ""
+    property string voicePath: ""
+    property int voiceSecs: 0
+    property string voiceError: ""
+    // Blink phase for the recording dot (lives in SendMessageBar.qml, which
+    // root-level code cannot reach by id — see note at the alias block).
+    property bool recDotLit: true
+
+    CaptureSession {
+        id: voiceCapture
+        audioInput: AudioInput { id: voiceMic }
+        recorder: MediaRecorder {
+            id: voiceRecorder
+            onErrorOccurred: function(error, errorString) {
+                root.voiceError = errorString || "Microphone unavailable";
+                root.voiceState = "";
+                root.voiceSecs = 0;
+                voiceRecTimer.stop();
+                voiceErrorTimer.restart();
+            }
+        }
+    }
+
+    Timer {
+        id: voiceRecTimer
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: {
+            root.voiceSecs++;
+            root.recDotLit = !root.recDotLit;
+        }
+    }
+
+    Timer {
+        id: voiceErrorTimer
+        interval: 3000
+        repeat: false
+        running: false
+        onTriggered: root.voiceError = ""
+    }
+
+    function voiceDraftUrl() {
+        if (!root.voicePath) return "";
+        var p = String(root.voicePath);
+        return p.indexOf("file://") === 0 ? p : "file://" + p;
+    }
+
+    function startVoiceNote() {
+        if (root.voiceState === "recording" || !root.activeChat) return;
+        root.stopAudio();
+        var dir = "";
+        try { dir = StandardPaths.writableLocation(StandardPaths.TempLocation); } catch (e) {}
+        if (!dir) dir = "/tmp";
+        var plain = String(dir).replace(/\/$/, "") + "/wa-voicenote-" + Date.now() + ".ogg";
+        root.voicePath = plain;
+        root.voiceSecs = 0;
+        root.recDotLit = true;
+        root.voiceError = "";
+        try {
+            voiceRecorder.outputLocation = "file://" + plain;
+            voiceRecorder.record();
+        } catch (e) {
+            root.voiceError = "Microphone unavailable";
+            root.voicePath = "";
+            voiceErrorTimer.restart();
+            return;
+        }
+        root.voiceState = "recording";
+        voiceRecTimer.start();
+    }
+
+    function stopVoiceNote() {
+        if (root.voiceState !== "recording") return;
+        try { voiceRecorder.stop(); } catch (e) {}
+        voiceRecTimer.stop();
+        try {
+            var actual = String(voiceRecorder.actualLocation || "");
+            if (actual) root.voicePath = actual.replace(/^file:\/\//, "");
+        } catch (e) {}
+        root.voiceState = root.voicePath ? "draft" : "";
+    }
+
+    function toggleVoiceNote() {
+        if (root.voiceState === "recording") root.stopVoiceNote();
+        else if (root.voiceState === "") root.startVoiceNote();
+    }
+
+    function discardVoiceNote() {
+        try { voiceRecorder.stop(); } catch (e) {}
+        voiceRecTimer.stop();
+        if (String(root.audioPlayingMsgId) === "__draft__") root.stopAudio();
+        root.voiceState = "";
+        root.voicePath = "";
+        root.voiceSecs = 0;
+    }
+
+    function playVoiceDraft() {
+        if (!root.voicePath) return;
+        if (String(root.audioPlayingMsgId) === "__draft__" && root.audioIsPlaying) {
+            audioPlayer.pause();
+            return;
+        }
+        root.toggleAudioPlayback({ id: "__draft__", fullUrl: root.voiceDraftUrl() });
+    }
+
+    function sendVoiceNote() {
+        if (!root.activeChat || !root.voicePath || root.sendInFlight) return;
+        var path = String(root.voicePath);
+        var chatId = root.activeChat.id;
+        if (String(root.audioPlayingMsgId) === "__draft__") root.stopAudio();
+        root.voiceState = "";
+        root.voicePath = "";
+        root.voiceSecs = 0;
+        root.sendFile(chatId, path, "");
     }
 
     // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
@@ -640,15 +1549,141 @@ PlasmoidItem {
         root.mediaList = list;
         root.mediaIndex = startIndex;
         root.viewerVisible = true;
+        root.viewerFullFailed = false;
+        root.viewerLoadFull();
     }
 
     function closeMediaViewer() {
         root.viewerVisible = false;
+        root.viewerFullLoading = false;
+        root.viewerFullFailed = false;
     }
 
     function viewerStep(d) {
         if (!root.mediaList || root.mediaList.length === 0) return;
+        root.viewerFullFailed = false;
         root.mediaIndex = (root.mediaIndex + d + root.mediaList.length) % root.mediaList.length;
+    }
+
+    // Fetch full-res (maxEdge 0) for the current viewer index with a spinner;
+    // the cached 480p thumb stays painted until the full image arrives.
+    function viewerLoadFull() {
+        var m = null;
+        if (root.mediaList && root.mediaList.length > 0) {
+            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            m = root.mediaList[ci];
+        }
+        if (!m) {
+            root.viewerFullLoading = false;
+            return;
+        }
+        var mid = m.id || "";
+        if (m.fullUrl) {
+            root.viewerFullMsgId = mid;
+            root.viewerFullSource = m.fullUrl;
+            root.viewerFullLoading = false;
+            root.viewerPrefetchNeighbours();
+            return;
+        }
+        if (!root.isConnected || !root.activeChat || !mid) {
+            root.viewerFullLoading = false;
+            return;
+        }
+        root.viewerFullMsgId = mid;
+        root.viewerFullSource = "";
+        root.viewerFullLoading = true;
+        root.viewerFullFailed = false;
+        var chatId = root.activeChat.id;
+        root.fetchMedia(chatId, mid, 0, function(url) {
+            var cur = null;
+            if (root.mediaList && root.mediaList.length > 0) {
+                var ni = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+                cur = root.mediaList[ni];
+            }
+            if (!cur || (cur.id || "") !== mid) return;
+            if (url && url !== "") {
+                root.viewerFullSource = url;
+                for (var i = 0; i < root.activeChatMessages.length; i++) {
+                    if (root.activeChatMessages[i] && root.activeChatMessages[i].id === mid) {
+                        root.activeChatMessages[i].fullUrl = url;
+                        break;
+                    }
+                }
+                root.viewerFullLoading = false;
+                root.viewerFullFailed = false;
+            } else {
+                root.viewerFullSource = "";
+                root.viewerFullLoading = false;
+                root.viewerFullFailed = true;
+            }
+            root.viewerPrefetchNeighbours();
+        });
+    }
+
+    // Low-priority prefetch of full-res for prev/next neighbours; failures
+    // are silent (viewer still shows the cached thumb + retry on revisit).
+    function viewerPrefetchNeighbours() {
+        if (!root.isConnected || !root.activeChat) return;
+        if (!root.mediaList || root.mediaList.length < 2) return;
+        var idx = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+        var chatId = root.activeChat.id;
+        var sides = [idx - 1, idx + 1];
+        for (var s = 0; s < sides.length; s++) {
+            (function(ni) {
+                if (ni < 0 || ni >= root.mediaList.length) return;
+                var nm = root.mediaList[ni];
+                if (!nm || !nm.id || nm.fullUrl) return;
+                var nid = nm.id;
+                root.fetchMedia(chatId, nid, 0, function(url) {
+                    if (!url) return;
+                    for (var i = 0; i < root.mediaList.length; i++) {
+                        if (root.mediaList[i] && root.mediaList[i].id === nid) {
+                            root.mediaList[i].fullUrl = url;
+                            break;
+                        }
+                    }
+                });
+            })(sides[s]);
+        }
+    }
+
+    // Open a media image in the system viewer via POST /api/openExternally
+    // (full-res fetch + xdg-open server-side). Primary path: tapping an image
+    // bubble (no in-app viewer detour); also used by the viewer toolbar.
+    // Progress/failures surface as a transient toast over the chat, never
+    // silent or fatal.
+    function openExternallyMsg(m) {
+        if (!m || !m.id || !root.isConnected || !root.activeChat) {
+            root.externalOpenToast = "Couldn't open image";
+            externalOpenToastTimer.restart();
+            return;
+        }
+        root.externalOpenToast = "Opening in system viewer…";
+        externalOpenToastTimer.stop();
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/openExternally");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                root.externalOpenToast = "";
+            } else {
+                root.externalOpenToast = "Couldn't open in system viewer";
+                externalOpenToastTimer.restart();
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: root.activeChat.id, msgId: m.id } }));
+    }
+
+    // Viewer toolbar variant: opens whichever image is currently shown.
+    function openExternallyCurrent() {
+        var m = null;
+        if (root.mediaList && root.mediaList.length > 0) {
+            var ci = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
+            m = root.mediaList[ci];
+        }
+        root.openExternallyMsg(m);
     }
 
     function sendMessage(chatId, text) {
@@ -674,12 +1709,13 @@ PlasmoidItem {
             currentMsgs.push(root.activeChatMessages[idx]);
         }
         currentMsgs.push(tempMsg);
-        root.activeChatMessages = currentMsgs;
+        root.applyMessagesModel(currentMsgs);
 
         // Position at the bottom of the messages list
         Qt.callLater(function() {
-            if (typeof messageListView !== "undefined" && messageListView) {
-                messageListView.positionViewAtEnd();
+            var lv = root.getMsgListView();
+            if (lv) {
+                lv.positionViewAtEnd();
             }
         });
 
@@ -750,19 +1786,111 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: {} }));
     }
 
+    // ── Optimistic reactions (REQ-002/AC-001) ─────────────────────────────
+    // Chip click and picker-with-activeReactionMsgId both funnel through
+    // sendReaction() below, so the optimistic apply lives here centrally.
+    // Add path pushes {emoji, sender:"", fromMe:true}; toggle-off removes
+    // one own entry for that emoji. Server truth replaces the optimistic
+    // entry via the existing merge path (mergeMessages by id in
+    // fetchMessages), for both full-fetch and since-poll arrivals.
+    function applyOptimisticReaction(msgId, emoji, remove) {
+        if (!msgId || !emoji) return;
+        var key = String(msgId);
+        var msgs = root.activeChatMessages;
+        var found = false;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === key) {
+                if (root._reactionSnapshots[key] === undefined) {
+                    var nextSnap = {};
+                    for (var k in root._reactionSnapshots) nextSnap[k] = root._reactionSnapshots[k];
+                    nextSnap[key] = msgs[i].reactions ? msgs[i].reactions.slice() : [];
+                    root._reactionSnapshots = nextSnap;
+                }
+                var cur = msgs[i].reactions ? msgs[i].reactions.slice() : [];
+                if (remove) {
+                    for (var r = 0; r < cur.length; r++) {
+                        if (cur[r] && String(cur[r].emoji) === String(emoji) && cur[r].fromMe) {
+                            cur.splice(r, 1);
+                            break;
+                        }
+                    }
+                } else {
+                    var hasOwn = false;
+                    for (var a = 0; a < cur.length; a++) {
+                        if (cur[a] && String(cur[a].emoji) === String(emoji) && cur[a].fromMe) { hasOwn = true; break; }
+                    }
+                    if (!hasOwn) cur.push({ emoji: emoji, sender: "", fromMe: true });
+                }
+                msgs[i].reactions = cur;
+                found = true;
+                break;
+            }
+        }
+        if (found) root.applyMessagesModel(msgs.slice());
+    }
+
+    function rollbackOptimisticReaction(msgId) {
+        var key = String(msgId);
+        if (root._reactionSnapshots[key] === undefined) return;
+        var prev = root._reactionSnapshots[key];
+        var msgs = root.activeChatMessages;
+        for (var i = 0; i < msgs.length; i++) {
+            if (msgs[i] && String(msgs[i].id) === key) {
+                msgs[i].reactions = prev;
+                break;
+            }
+        }
+        root.applyMessagesModel(msgs.slice());
+    }
+
+    function clearReactionFlight(msgId) {
+        var key = String(msgId);
+        var f = {};
+        for (var k in root.reactionInFlight) { if (k !== key) f[k] = root.reactionInFlight[k]; }
+        root.reactionInFlight = f;
+        var s = {};
+        for (var k2 in root._reactionSnapshots) { if (k2 !== key) s[k2] = root._reactionSnapshots[k2]; }
+        root._reactionSnapshots = s;
+    }
+
     function sendReaction(chatId, msgId, reaction, remove) {
         if (!root.isConnected || !chatId || !msgId || !reaction) return;
+        var key = String(msgId);
+        // In-flight guard (spec section 9 double-click race): one send per
+        // msgId at a time; rapid toggles while a POST is outstanding are
+        // ignored so add/remove cannot interleave out of order.
+        if (root.reactionInFlight[key]) return;
+        var next = {};
+        for (var k in root.reactionInFlight) next[k] = root.reactionInFlight[k];
+        next[key] = true;
+        root.reactionInFlight = next;
+        var wantRemove = !!remove;
+        root.applyOptimisticReaction(msgId, reaction, wantRemove);
         var xhr = new XMLHttpRequest();
         xhr.open("POST", apiHost + "/api/sendReaction");
         xhr.setRequestHeader("Content-Type",  "application/json");
         xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.timeout = 30000;
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             if (xhr.status === 200) {
-                fetchMessages(root.activeChat.id);
+                root.clearReactionFlight(msgId);
+                if (root.activeChat) fetchMessages(root.activeChat.id);
+            } else {
+                root.rollbackOptimisticReaction(msgId);
+                root.clearReactionFlight(msgId);
             }
         };
-        xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction, remove: !!remove } }));
+        xhr.ontimeout = function() {
+            root.rollbackOptimisticReaction(msgId);
+            root.clearReactionFlight(msgId);
+        };
+        try {
+            xhr.send(JSON.stringify({ args: { chatId: chatId, msgId: msgId, reaction: reaction, remove: wantRemove } }));
+        } catch (e) {
+            root.rollbackOptimisticReaction(msgId);
+            root.clearReactionFlight(msgId);
+        }
     }
 
     // Paste: save the clipboard image as a DRAFT attachment. It is NOT sent
@@ -813,18 +1941,17 @@ PlasmoidItem {
         }
     }
 
+    function toggleArchivedView() {
+        root.showArchived = !root.showArchived;
+        root.searchQuery = "";
+        root.chatsShown = 20;
+        filterChats();
+    }
+
     function filterChats() {
         if (!root.allChats || root.allChats.length === 0) { root.filteredChats = []; return; }
-        var q = root.searchQuery.trim().toLowerCase();
-        if (q === "") { root.filteredChats = root.allChats; return; }
-        var res = [];
-        for (var i = 0; i < root.allChats.length; i++) {
-            var c = root.allChats[i];
-            var n = (c.name || c.formattedTitle || "").toLowerCase();
-            var phone = ((c.id || "").split("@")[0] || "").toLowerCase();
-            if (n.indexOf(q) !== -1 || phone.indexOf(q) !== -1) res.push(c);
-        }
-        root.filteredChats = res;
+        root.filteredChats = MsgUtils.filterChats(root.allChats, root.searchQuery,
+                                                  root.archivedChats, root.showArchived);
     }
 
     // ── Commonly used emojis for picker ──────────────────────────────────────────────────
@@ -912,19 +2039,6 @@ PlasmoidItem {
         onTriggered: filterChats()
     }
 
-    FileDialog {
-        id: fileDialog
-        title: "Select an attachment"
-        nameFilters: [
-            "Images and Media (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.mp4 *.mov *.avi)",
-            "All Files (*)"
-        ]
-        onAccepted: {
-            if (root.activeChat && selectedFile) {
-                sendFile(root.activeChat.id, selectedFile.toString());
-            }
-        }
-    }
 
     // ── Compact representation ────────────────────────────────────────────────
     compactRepresentation: Item {
@@ -1153,1449 +2267,91 @@ PlasmoidItem {
                 }
             }
 
-            // ═══════════════════════════════════════════════════
-            // PAGE 1 — Chat List
-            // ═══════════════════════════════════════════════════
-            ColumnLayout {
-                spacing: 0
-
-                // ── Header bar ─────────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 56
-                    color: root.colHeader
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 14; rightMargin: 10; topMargin: 8; bottomMargin: 8 }
-                        spacing: 10
-
-                        // WA logo
-                        Rectangle {
-                            width: 36; height: 36; radius: 18
-                            color: root.colAccent
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                text: "💬"
-                                font.pointSize: 16
-                            }
-                        }
-
-                        PlasmaComponents.Label {
-                            text: "WhatsApp Quick"
-                            font.bold: true
-                            font.pointSize: 13
-                            color: root.colText
-                            Layout.fillWidth: true
-                        }
-
-                        // Loading spinner (small)
-                        Rectangle {
-                            visible: root.isLoading
-                            width: 20; height: 20; radius: 10
-                            color: "transparent"
-                            border.color: root.colAccent
-                            border.width: 2
-                            RotationAnimation on rotation {
-                                from: 0; to: 360; duration: 1000
-                                loops: Animation.Infinite; running: root.isLoading
-                            }
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "view-refresh"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Refresh chats"
-                            ToolTip.visible: hovered
-                            onClicked: fetchChats()
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "system-reboot"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Restart WhatsApp Connection"
-                            ToolTip.visible: hovered
-                            onClicked: restartBackend()
-                        }
-                    }
-                }
-
-                // ── Search box ─────────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 44
-                    color: root.colPanel
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-                        spacing: 6
-
-                        PlasmaComponents.Label { text: "🔍"; font.pointSize: 11 }
-
-                        PlasmaComponents.TextField {
-                            id: searchBar
-                            placeholderText: "Search name or number…"
-                            Layout.fillWidth: true
-                            color: root.colText
-                            background: Item {}
-                            onTextChanged: { root.searchQuery = text; searchDebounceTimer.restart(); }
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "edit-clear"
-                            visible: searchBar.text.length > 0
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            onClicked: { searchBar.text = ""; root.searchQuery = ""; filterChats(); }
-                        }
-                    }
-                }
-
-                // ── Separator ──────────────────────────────────
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Chat list ──────────────────────────────────
-                PlasmaComponents.ScrollView {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-
-                    ListView {
-                        id: chatListView
-                        width: parent.width
-                        model: root.filteredChats.slice(0, root.chatsShown)
-                        spacing: 0
-                        reuseItems: true
-
-                        // Infinite scroll: grow the window when the user hits
-                        // the bottom of the rendered chats.
-                        onAtYEndChanged: {
-                            if (atYEnd && root.filteredChats.length > root.chatsShown) {
-                                root.chatsShown += 20;
-                            }
-                        }
-
-                        // Empty state
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: root.filteredChats.length === 0 && !root.isLoading
-                            text: root.searchQuery ? "No results for \"" + root.searchQuery + "\"" : "No chats found"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        delegate: Rectangle {
-                            id: chatRow
-                            width: chatListView.width
-                            height: 68
-                            color: hovered ? root.colPanel : "transparent"
-
-                            property bool hovered: false
-                            MouseArea {
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                onEntered: chatRow.hovered = true
-                                onExited:  chatRow.hovered = false
-                                onClicked: function(mouse) {
-                                    if (mouse.button === Qt.RightButton) {
-                                        root.contextChat = modelData;
-                                        chatContextMenu.popup(chatRow, mouse.x, mouse.y);
-                                    } else {
-                                        root.activeChat = {
-                                            id:      modelData.id,
-                                            name:    modelData.name || modelData.formattedTitle || "Unknown",
-                                            isGroup: modelData.isGroup || false
-                                        };
-                                    }
-                                }
-                            }
-
-                            Behavior on color { ColorAnimation { duration: 120 } }
-
-                            RowLayout {
-                                anchors { fill: parent; leftMargin: 14; rightMargin: 14 }
-                                spacing: 12
-
-                                // Avatar (profile picture with colored-initials fallback)
-                                Rectangle {
-                                    width: 44; height: 44; radius: 22
-                                    color: root.avatarColor(modelData.name || modelData.formattedTitle || "")
-
-                                    PlasmaComponents.Label {
-                                        anchors.centerIn: parent
-                                        text: modelData.isGroup ? "👥" : root.chatInitial(modelData)
-                                        font.bold: !modelData.isGroup
-                                        font.pointSize: modelData.isGroup ? 20 : 16
-                                        color: "#ffffff"
-                                    }
-
-                                    // Circular mask for the photo (white = visible).
-                                    Rectangle {
-                                        id: avatarMaskShape
-                                        width: 44; height: 44; radius: 22
-                                        visible: false
-                                        color: "#ffffff"
-                                    }
-
-                                    // Avatar photo on top when available.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: root.avatarSource(modelData.id)
-                                        sourceSize.width: 88
-                                        sourceSize.height: 88
-                                        asynchronous: true
-                                        fillMode: Image.PreserveAspectCrop
-                                        visible: source !== ""
-                                        layer.enabled: source !== ""
-                                        layer.smooth: true
-                                        layer.effect: MultiEffect {
-                                            maskEnabled: true
-                                            maskSource: avatarMaskShape
-                                        }
-                                    }
-
-                                    // Online indicator (if available)
-                                    Rectangle {
-                                        visible: !modelData.isGroup && (modelData.isOnline || false)
-                                        width: 12; height: 12; radius: 6
-                                        color: root.colGreen
-                                        border.color: root.colBg
-                                        border.width: 2
-                                        anchors { bottom: parent.bottom; right: parent.right }
-                                    }
-                                }
-
-                                // Text block
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 2
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 4
-
-                                        PlasmaComponents.Label {
-                                            visible: root.isChatPinned(modelData)
-                                            text: "📌"
-                                            font.pointSize: 8
-                                        }
-
-                                        PlasmaComponents.Label {
-                                            text: modelData.name || modelData.formattedTitle || "Unknown"
-                                            font.bold: true
-                                            font.pointSize: 10
-                                            color: root.colText
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
-                                        }
-
-                                        PlasmaComponents.Label {
-                                            text: root.formatTime(modelData.t || (modelData.lastMessage && modelData.lastMessage.t) || 0)
-                                            font.pointSize: 8
-                                            color: (modelData.unreadCount || 0) > 0 ? root.colGreen : root.colSub
-                                        }
-                                    }
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 4
-
-                                        PlasmaComponents.Label {
-                                            text: root.lastPreview(modelData)
-                                            font.pointSize: 8.5
-                                            color: root.colSub
-                                            elide: Text.ElideRight
-                                            maximumLineCount: 1
-                                            wrapMode: Text.NoWrap
-                                            Layout.fillWidth: true
-                                        }
-
-                                        // Unread badge
-                                        Rectangle {
-                                            visible: (modelData.unreadCount || 0) > 0
-                                            width:  Math.max(20, unreadLabel.implicitWidth + 8)
-                                            height: 20
-                                            radius: 10
-                                            color:  root.colGreen
-
-                                            PlasmaComponents.Label {
-                                                id: unreadLabel
-                                                anchors.centerIn: parent
-                                                text: (modelData.unreadCount || 0) > 99 ? "99+" : (modelData.unreadCount || "")
-                                                font.pointSize: 7
-                                                font.bold: true
-                                                color: "#ffffff"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Bottom divider
-                            Rectangle {
-                                anchors { bottom: parent.bottom; left: parent.left; right: parent.right; leftMargin: 70 }
-                                height: 1
-                                color: root.colBorder
-                                opacity: 0.5
-                            }
-                        }
-                    }
-                }
+            // ── Page 1: chat list (ChatListPanel.qml) ──────────────────────────
+            ChatListPanel {
+                rootItem: root
             }
 
-            // ═══════════════════════════════════════════════════
-            // PAGE 2 — Compose Message
-            // ═══════════════════════════════════════════════════
-            ColumnLayout {
-                spacing: 0
-
-                // ── Compose header ─────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 60
-                    color: root.colHeader
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 6; rightMargin: 14 }
-                        spacing: 8
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-previous"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Back to chats"
-                            ToolTip.visible: hovered
-                            onClicked: root.activeChat = null
-                        }
-
-                        // Recipient avatar (photo with initials fallback)
-                        Rectangle {
-                            width: 38; height: 38; radius: 19
-                            color: root.activeChat ? root.avatarColor(root.activeChat.name) : root.colAccent
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                text: root.activeChat ? (root.activeChat.isGroup ? "👥" : root.activeChat.name.charAt(0).toUpperCase()) : "?"
-                                font.bold: !root.activeChat || !root.activeChat.isGroup
-                                font.pointSize: root.activeChat && root.activeChat.isGroup ? 18 : 14
-                                color: "#ffffff"
-                            }
-
-                            Rectangle {
-                                id: headerAvatarMask
-                                width: 38; height: 38; radius: 19
-                                visible: false
-                                color: "#ffffff"
-                            }
-
-                            Image {
-                                anchors.fill: parent
-                                source: root.activeChat ? root.avatarSource(root.activeChat.id) : ""
-                                sourceSize.width: 76
-                                sourceSize.height: 76
-                                asynchronous: true
-                                fillMode: Image.PreserveAspectCrop
-                                visible: source !== ""
-                                layer.enabled: source !== ""
-                                layer.smooth: true
-                                layer.effect: MultiEffect {
-                                    maskEnabled: true
-                                    maskSource: headerAvatarMask
-                                }
-                            }
-                        }
-
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 1
-
-                            PlasmaComponents.Label {
-                                text: root.activeChat ? root.activeChat.name : ""
-                                font.bold: true
-                                font.pointSize: 11
-                                color: root.colText
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-                            // "Updating…" cue while a revalidate/poll is in
-                            // flight over an already-rendered list (MRU cache
-                            // hits must visibly refresh, never sit stale).
-                            PlasmaComponents.Label {
-                                visible: root.messagesInFlight && root.activeChatMessages.length > 0
-                                text: "Updating…"
-                                font.pointSize: 7.5
-                                color: root.colSub
-                            }
-                            // Subtitle (JID/phone number) intentionally hidden —
-                            // the raw WhatsApp ID under the name was visual noise.
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Message History ────────────────────────────
-                PlasmaComponents.ScrollView {
-                    id: messageScroll
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-
-                    ListView {
-                        id: messageListView
-                        model: root.activeChatMessages
-                        spacing: 4
-                        clip: true
-                        // NOTE: deliberately NO reuseItems here. This delegate's
-                        // height comes from chained implicitHeight bindings
-                        // (bubble → wrapping Text → anchored layouts), and the
-                        // model is a JS array that is replaced on every merge.
-                        // Item recycling keeps stale sizes/bindings and renders
-                        // overlapping, overflowing bubbles.
-
-                        // Always land on the most recent message — but only
-                        // when the user is already at (or near) the bottom, so
-                        // background updates don't yank the scroll position.
-                        onCountChanged: {
-                            if (count > 0 && messageListView.atYEnd) Qt.callLater(messageListView.positionViewAtEnd);
-                        }
-                        onWidthChanged: if (count > 0) Qt.callLater(messageListView.positionViewAtEnd);
-
-                        // Top-edge lazy loading: fetch 20 older messages when
-                        // the user scrolls to the very top.
-                        onAtYBeginningChanged: {
-                            if (atYBeginning && root.msgsHasMore && !root.msgsLoadingOlder &&
-                                root.msgsTopError === "" && contentY < 200 &&
-                                root.activeChatMessages.length > 0) {
-                                root.fetchOlderMessages();
-                            }
-                        }
-
-                        header: Item {
-                            width: messageListView.width
-                            height: (root.msgsLoadingOlder || root.msgsTopError !== "") ? 36 : 0
-                            visible: height > 0
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                visible: root.msgsLoadingOlder
-                                text: "Loading older messages…"
-                                color: root.colSub
-                                font.pointSize: 8
-                            }
-
-                            RowLayout {
-                                anchors.centerIn: parent
-                                spacing: 8
-                                visible: root.msgsTopError !== ""
-
-                                PlasmaComponents.Label {
-                                    text: root.msgsTopError
-                                    color: root.colSub
-                                    font.pointSize: 8
-                                }
-
-                                PlasmaComponents.Label {
-                                    text: "↻ Retry"
-                                    color: root.colAccent
-                                    font.pointSize: 8.5
-
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.fetchOlderMessages()
-                                    }
-                                }
-                            }
-                        }
-
-                        // Placeholder if loading messages
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: root.isLoadingMessages && root.activeChatMessages.length === 0
-                            text: "Loading messages…"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        // Placeholder if no messages
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: !root.isLoadingMessages && root.activeChatMessages.length === 0
-                            text: "No messages in this chat"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        delegate: Item {
-                            id: msgDelegateRoot
-                            width: messageListView.width
-                            // Use the column's full implicit height + padding for
-                            // the reaction button that overflows below the bubble.
-                            height: msgBubbleCol.implicitHeight + 16
-
-                            // Right-click a message -> context menu (Reply / Copy message)
-                            MouseArea {
-                                anchors.fill: parent
-                                acceptedButtons: Qt.RightButton
-                                onClicked: function(mouse) {
-                                    root.contextReplyMsg = modelData;
-                                    msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
-                                }
-                            }
-
-                            ColumnLayout {
-                                id: msgBubbleCol
-                                anchors { left: parent.left; right: parent.right }
-                                spacing: 0
-
-                                RowLayout {
-                                    spacing: 8
-                                    layoutDirection: modelData.fromMe ? Qt.RightToLeft : Qt.LeftToRight
-
-                                    Item { width: 6 }
-
-                                    Rectangle {
-                                        id: msgBubble
-                                        width: {
-                                            var w = msgTime.implicitWidth + 30;
-                                            if (msgText.visible) {
-                                                w = Math.max(w, msgText.implicitWidth + 20);
-                                            } else if (msgImage.visible) {
-                                                w = Math.max(w, Math.min(messageListView.width * 0.7, 240));
-                                            }
-                                            return Math.min(messageListView.width * 0.75, w);
-                                        }
-                                        implicitHeight: msgCol.implicitHeight + 12
-                                        Layout.preferredHeight: implicitHeight
-                                        radius: 8
-                                        color: modelData.fromMe ? "#005c4b" : root.colPanel
-                                        border.color: root.colBorder
-                                        border.width: 1
-
-                                        ColumnLayout {
-                                            id: msgCol
-                                            anchors { fill: parent; margins: 8; topMargin: 6; bottomMargin: 6 }
-                                            spacing: 3
-
-                                            // Sender name (for groups)
-                                            PlasmaComponents.Label {
-                                                visible: root.activeChat && root.activeChat.isGroup && !modelData.fromMe && modelData.senderName
-                                                text: modelData.senderName || ""
-                                                font.pointSize: 7.5
-                                                font.bold: true
-                                                color: root.colGreen
-                                                Layout.fillWidth: true
-                                                elide: Text.ElideRight
-                                            }
-
-                                            // Quoted message preview (reply context)
-                                            Rectangle {
-                                                visible: !!(modelData.quotedMsg && modelData.quotedMsg.body)
-                                                Layout.fillWidth: true
-                                                Layout.preferredHeight: quotedCol.implicitHeight + 10
-                                                radius: 4
-                                                color: modelData.fromMe ? "#0a4639" : "#1a2930"
-                                                clip: true
-
-                                                // Green left accent bar
-                                                Rectangle {
-                                                    width: 3
-                                                    anchors { top: parent.top; bottom: parent.bottom; left: parent.left; leftMargin: 0 }
-                                                    radius: 1.5
-                                                    color: root.colAccent
-                                                }
-
-                                                ColumnLayout {
-                                                    id: quotedCol
-                                                    anchors { fill: parent; leftMargin: 8; rightMargin: 6; topMargin: 5; bottomMargin: 5 }
-                                                    spacing: 1
-
-                                                    PlasmaComponents.Label {
-                                                        visible: !!(modelData.quotedMsg && modelData.quotedMsg.senderName)
-                                                        text: (modelData.quotedMsg && modelData.quotedMsg.senderName) || ""
-                                                        font.pointSize: 7
-                                                        font.bold: true
-                                                        color: root.colAccent
-                                                        elide: Text.ElideRight
-                                                        Layout.fillWidth: true
-                                                    }
-
-                                                    PlasmaComponents.Label {
-                                                        text: {
-                                                            if (!modelData.quotedMsg) return "";
-                                                            var qType = modelData.quotedMsg.type || "chat";
-                                                            if (qType === "image") return "📷 Photo";
-                                                            if (qType === "video") return "🎥 Video";
-                                                            if (qType === "audio") return "🎵 Audio";
-                                                            if (qType === "sticker") return "🪄 Sticker";
-                                                            if (qType === "document") return "📄 Document";
-                                                            var b = modelData.quotedMsg.body || "";
-                                                            return b.length > 80 ? b.substring(0, 80) + "…" : b;
-                                                        }
-                                                        font.pointSize: 7.5
-                                                        color: root.colSub
-                                                        elide: Text.ElideRight
-                                                        wrapMode: Text.NoWrap
-                                                        Layout.fillWidth: true
-                                                        maximumLineCount: 1
-                                                    }
-                                                }
-                                            }
-
-                                            // Message text - with emoji font support
-                                            Text {
-                                                id: msgText
-                                                visible: !(modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
-                                                text: modelData.body || ""
-                                                color: root.colText
-                                                font.pointSize: 9.5
-                                                font.family: root.emojiFont
-                                                wrapMode: Text.Wrap
-                                                Layout.fillWidth: true
-                                                renderType: Text.QtRendering
-                                            }
-
-                                            Image {
-                                                id: msgImage
-                                                visible: !modelData._thumb && (modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || (modelData.body && (modelData.body.startsWith("/9j/") || modelData.body.startsWith("data:image") || modelData.body.startsWith("iVBORw0KGgo"))))
-                                                source: {
-                                                    if (!visible || !modelData.body) return "";
-                                                    return MsgUtils.mediaSource(modelData);
-                                                }
-                                                fillMode: Image.PreserveAspectFit
-                                                Layout.maximumWidth: messageListView.width * 0.7
-                                                Layout.preferredWidth: Math.min(messageListView.width * 0.7, 240)
-                                                Layout.preferredHeight: Math.min(messageListView.width * 0.7, 180)
-                                                asynchronous: true
-
-                                                // Tap to open the fullscreen viewer.
-                                                MouseArea {
-                                                    anchors.fill: parent
-                                                    onClicked: {
-                                                        var list = MsgUtils.buildMediaList(root.activeChatMessages);
-                                                        var idx = -1;
-                                                        for (var i = 0; i < list.length; i++) {
-                                                            if (list[i].id === modelData.id) { idx = i; break; }
-                                                        }
-                                                        root.openMediaViewer(idx);
-                                                    }
-                                                }
-                                            }
-
-                                            // MRU cached-copy placeholder for large
-                                            // media (thumbnailized); the full body
-                                            // returns after revalidation.
-                                            PlasmaComponents.Label {
-                                                visible: !!modelData._thumb
-                                                text: MsgUtils.mediaLabel(modelData.type) || "📷 Media"
-                                                font.pointSize: 9
-                                                color: root.colSub
-                                                Layout.maximumWidth: messageListView.width * 0.7
-                                            }
-
-                                            PlasmaComponents.Label {
-                                                id: msgTime
-                                                text: root.formatTime(modelData.t)
-                                                font.pointSize: 7
-                                                color: root.colSub
-                                                Layout.alignment: Qt.AlignRight
-                                            }
-                                        }
-
-                                        // Reaction button (small emoji icon at bottom-right)
-                                        Rectangle {
-                                            id: reactionButton
-                                            anchors { bottom: parent.bottom; right: parent.right; bottomMargin: -8; rightMargin: -4 }
-                                            width: 22; height: 22; radius: 11
-                                            color: root.colSurface
-                                            border.color: root.colBorder
-                                            border.width: 1
-                                            z: 10
-
-                                            Text {
-                                                anchors.centerIn: parent
-                                                text: "😊"
-                                                font.pointSize: 10
-                                                font.family: root.emojiFont
-                                                renderType: Text.QtRendering
-                                            }
-
-                                            MouseArea {
-                                                anchors.fill: parent
-                                                onClicked: {
-                                                    root.activeReactionMsgId = modelData.id || "";
-                                                    root.emojiPickerVisible = true;
-                                                }
-                                            }
-
-                                            // Only show when the message delegate list is interactive
-                                            // (hides when the emoji picker is open over it)
-                                            visible: !root.emojiPickerVisible
-                                        }
-                                    }
-
-                                    Item {
-                                        Layout.fillWidth: true
-                                    }
-
-                                    Item { width: 6 }
-                                }
-
-                                // ── Reactions display row ─────────────────────────────
-                                RowLayout {
-                                    id: reactionsRow
-                                    property string parentMsgId: modelData.id || ""
-                                    Layout.leftMargin: modelData.fromMe ? 50 : 14
-                                    Layout.rightMargin: modelData.fromMe ? 14 : 50
-                                    spacing: 4
-                                    visible: modelData.reactions && modelData.reactions.length > 0
-
-                                    Repeater {
-                                        model: MsgUtils.aggregateReactions(modelData.reactions)
-                                        Rectangle {
-                                            id: reactChip
-                                            height: 22
-                                            width: reactContentRow.implicitWidth + 12
-                                            radius: 11
-                                            color: modelData.fromMe ? root.colAccentDim : (chipMouse.containsMouse ? root.colBorder : root.colPanel)
-                                            border.color: modelData.fromMe ? root.colAccent : root.colBorder
-                                            border.width: 1
-
-                                            Behavior on color { ColorAnimation { duration: 100 } }
-
-                                            RowLayout {
-                                                id: reactContentRow
-                                                anchors.centerIn: parent
-                                                spacing: 3
-
-                                                Text {
-                                                    text: modelData.emoji || ""
-                                                    font.pointSize: 10
-                                                    font.family: root.emojiFont
-                                                    renderType: Text.QtRendering
-                                                }
-
-                                                PlasmaComponents.Label {
-                                                    visible: modelData.count > 1
-                                                    text: modelData.count
-                                                    font.pointSize: 7.5
-                                                    font.bold: true
-                                                    color: root.colText
-                                                }
-                                            }
-
-                                            PlasmaComponents.ToolTip.visible: chipMouse.containsMouse && modelData.senders && modelData.senders.length > 0
-                                            PlasmaComponents.ToolTip.text: modelData.senders ? modelData.senders.join(", ") : ""
-
-                                            MouseArea {
-                                                id: chipMouse
-                                                anchors.fill: parent
-                                                hoverEnabled: true
-                                                onClicked: {
-                                                    if (root.activeChat && reactionsRow.parentMsgId) {
-                                                        root.sendReaction(root.activeChat.id, reactionsRow.parentMsgId, modelData.emoji, modelData.fromMe);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Item { Layout.fillWidth: true }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Quick-reply chips ──────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 42
-                    color: root.colSurface
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-                        spacing: 6
-
-                        Repeater {
-                            model: ["👍 OK", "😊 Thanks", "On my way!", "Running late", "Call me?"]
-
-                            Rectangle {
-                                height: 26
-                                width: chipLabel.implicitWidth + 16
-                                radius: 13
-                                color: chipMouse.containsMouse ? root.colAccentDim : root.colPanel
-                                border.color: root.colBorder
-                                border.width: 1
-
-                                Behavior on color { ColorAnimation { duration: 120 } }
-
-                                PlasmaComponents.Label {
-                                    id: chipLabel
-                                    anchors.centerIn: parent
-                                    text: modelData
-                                    font.pointSize: 8
-                                    color: root.colText
-                                }
-
-                                MouseArea {
-                                    id: chipMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        var snippet = modelData.replace(/^[^\s]+\s/, ""); // strip emoji prefix
-                                        if (modelData.charAt(0) === "👍" || modelData.charAt(0) === "😊")
-                                            messageInput.text += modelData.split(" ")[0] + " ";
-                                        else
-                                            messageInput.text += modelData + " ";
-                                        messageInput.forceActiveFocus();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Message Input area ─────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: (root.pendingReplyId !== "" || root.pendingAttachmentPath !== "") ? 92 : 70
-                    color: root.colHeader
-
-
-                    ColumnLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10; topMargin: 8; bottomMargin: 8 }
-                        spacing: 4
-
-                        // ── "Replying to…" quote bar ──────────────────────────
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            visible: root.pendingReplyId !== ""
-
-                            Rectangle {
-                                width: 3; height: 30; radius: 1.5
-                                color: root.colAccent
-                            }
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 0
-
-                                PlasmaComponents.Label {
-                                    text: "Replying to"
-                                    font.pointSize: 7
-                                    font.bold: true
-                                    color: root.colAccent
-                                }
-                                PlasmaComponents.Label {
-                                    text: root.replyPreviewLabel
-                                    font.pointSize: 8
-                                    color: root.colSub
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                }
-                            }
-
-                            PlasmaComponents.ToolButton {
-                                Layout.preferredWidth: 24
-                                Layout.preferredHeight: 24
-                                text: "✕"
-                                ToolTip.text: "Cancel reply"
-                                ToolTip.visible: hovered
-                                onClicked: root.clearPendingReply()
-                            }
-                        }
-
-                        // ── Pasted-image draft chip (not sent until send is pressed) ──
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            visible: root.pendingAttachmentPath !== ""
-
-                            Rectangle {
-                                width: 3; height: 26; radius: 1.5
-                                color: root.colAccent
-                            }
-
-                            PlasmaComponents.Label {
-                                Layout.fillWidth: true
-                                text: "📷 Image attached — press send to deliver"
-                                font.pointSize: 8
-                                color: root.colText
-                                elide: Text.ElideRight
-                            }
-
-                            PlasmaComponents.ToolButton {
-                                Layout.preferredWidth: 24
-                                Layout.preferredHeight: 24
-                                text: "✕"
-                                ToolTip.text: "Remove attachment"
-                                ToolTip.visible: hovered
-                                onClicked: root.clearPendingAttachment()
-                            }
-                        }
-
-                        RowLayout {
-                            spacing: 8
-                            Layout.fillWidth: true
-
-                            // Emoji button
-                            PlasmaComponents.ToolButton {
-                                id: emojiButton
-                                width: 36; height: 36
-                                icon.name: "face-smile"
-                                display: PlasmaComponents.ToolButton.IconOnly
-                                ToolTip.text: "Emojis"
-                                ToolTip.visible: hovered
-                                onClicked: {
-                                    if (root.emojiPickerVisible && root.activeReactionMsgId === "") {
-                                        root.emojiPickerVisible = false;
-                                    } else {
-                                        root.activeReactionMsgId = "";
-                                        root.emojiPickerVisible = true;
-                                    }
-                                }
-                            }
-
-                            // Attach button
-                            PlasmaComponents.ToolButton {
-                                id: attachButton
-                                width: 36; height: 36
-                                icon.name: "mail-attachment"
-                                display: PlasmaComponents.ToolButton.IconOnly
-                                ToolTip.text: "Send file"
-                                ToolTip.visible: hovered
-                                onClicked: fileDialog.open()
-                            }
-
-                            // Input text box
-                            Rectangle {
-                                Layout.fillWidth: true
-                                height: 36
-                                color: root.colPanel
-                                border.color: messageInput.activeFocus ? root.colAccent : root.colBorder
-                                border.width: messageInput.activeFocus ? 1.5 : 1
-                                radius: 18
-
-                                RowLayout {
-                                    anchors.fill: parent
-                                    anchors.leftMargin: 12
-                                    anchors.rightMargin: 12
-                                    spacing: 6
-
-                                    Flickable {
-                                        id: flick
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                        clip: true
-                                        contentWidth: width
-                                        contentHeight: messageInput.implicitHeight
-                                        flickableDirection: Flickable.VerticalFlick
-                                        boundsBehavior: Flickable.StopAtBounds
-
-                                        // Helper: keep the cursor rectangle visible
-                                        function ensureCursorVisible() {
-                                            var r = messageInput.cursorRectangle;
-                                            // Vertical
-                                            if (r.y < flick.contentY)
-                                                flick.contentY = r.y;
-                                            else if (r.y + r.height > flick.contentY + flick.height)
-                                                flick.contentY = r.y + r.height - flick.height;
-                                        }
-
-                                        TextEdit {
-                                            id: messageInput
-                                            Component.onCompleted: root.messageInputRef = messageInput
-                                            width: flick.width
-                                            wrapMode: TextEdit.Wrap
-                                            color: root.colText
-                                            font.pointSize: 9.5
-                                            font.family: root.emojiFont
-                                            selectionColor: root.colAccent
-                                            focus: true
-
-                                            // Auto-scroll the Flickable whenever the cursor moves
-                                            onCursorRectangleChanged: flick.ensureCursorVisible()
-
-                                            Text {
-                                                anchors.fill: parent
-                                                text: "Type a message…"
-                                                color: root.colSub
-                                                font: parent.font
-                                                visible: parent.text.length === 0
-                                            }
-
-                                            Keys.onReturnPressed: function(event) {
-                                                event.accepted = true;
-                                                if (event.modifiers & Qt.ShiftModifier) {
-                                                    messageInput.insert(messageInput.cursorPosition, "\n");
-                                                } else {
-                                                    sendComposed();
-                                                }
-                                            }
-
-
-                                            Keys.onPressed: function(event) {
-                                                if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
-                                                    if (event.modifiers & Qt.ShiftModifier) {
-                                                        event.accepted = true;
-                                                        pasteImageFromClipboard();
-                                                    } else {
-                                                        var hadSelection = messageInput.selectedText.length > 0;
-                                                        var oldLen = messageInput.text.length;
-                                                        messageInput.paste();
-                                                        if (!hadSelection && messageInput.text.length === oldLen) {
-                                                            // No text was inserted by Qt paste, check if clipboard contains an image
-                                                            pasteImageFromClipboard();
-                                                        }
-                                                        event.accepted = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Send button (always visible, dimmed when no text)
-                            Rectangle {
-                                width: 36; height: 36
-                                radius: 18
-                                color: {
-                                    if (sendMouseArea.containsMouse && (messageInput.text.trim().length > 0 || root.pendingAttachmentPath !== "") && !root.sendInFlight) return root.colAccentDim;
-                                    return root.colAccent;
-                                }
-                                opacity: ((messageInput.text.trim().length === 0 && root.pendingAttachmentPath === "") || root.sendInFlight) ? 0.5 : 1.0
-
-                                Behavior on color { ColorAnimation { duration: 150 } }
-
-                                PlasmaComponents.Label {
-                                    anchors.centerIn: parent
-                                    text: root.sendInFlight ? "⏳" : "➤"
-                                    color: "#ffffff"
-                                    font.pointSize: 12
-                                }
-
-                                MouseArea {
-                                    id: sendMouseArea
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        sendComposed();
-                                    }
-                                }
-                            }
-                        }
-
-                        // Hint text
-                        PlasmaComponents.Label {
-                            text: "Shift+Enter for new line"
-                            font.pointSize: 7
-                            color: root.colSub
-                            Layout.alignment: Qt.AlignHCenter
-                        }
-                    }
-                }
+            // ── Page 2: message history + compose (MessagesPanel.qml) ─────────
+            MessagesPanel {
+                rootItem: root
+                audioPlayerRef: audioPlayer
             }
         }
 
-        // ── Emoji Picker Overlay ─────────────────────────────────────────────
-        Rectangle {
-            visible: root.emojiPickerVisible
+        // ── Emoji Picker Overlay (EmojiPickerOverlay.qml) ──────────────────
+        EmojiPickerOverlay {
             anchors.fill: parent
-            color: "#00000000"
-
-            // Tap outside to dismiss
-            MouseArea {
-                anchors.fill: parent
-                onClicked: {
-                    root.emojiPickerVisible = false;
-                    root.activeReactionMsgId = "";
-                }
-            }
-
-            Rectangle {
-                anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
-                height: 200
-                color: root.colPanel
-                border.color: root.colBorder
-                border.width: 1
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 0
-
-                    // Quick reaction row
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 50
-                        color: root.colHeader
-
-                        RowLayout {
-                            anchors.centerIn: parent
-                            spacing: 8
-
-                            Repeater {
-                                model: ["👍", "❤️", "😂", "😮", "😢", "🙏"]
-                                Rectangle {
-                                    width: 36; height: 36; radius: 18
-                                    color: emojiHover.containsMouse ? root.colAccentDim : root.colSurface
-                                    border.color: root.colBorder
-                                    border.width: 1
-
-                                    Behavior on color { ColorAnimation { duration: 100 } }
-
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData
-                                        font.pointSize: 18
-                                        font.family: root.emojiFont
-                                        renderType: Text.QtRendering
-                                    }
-
-                                    MouseArea {
-                                        id: emojiHover
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onClicked: {
-                                            if (root.activeReactionMsgId && root.activeChat) {
-                                                root.sendReaction(root.activeChat.id, root.activeReactionMsgId, modelData);
-                                            } else if (!root.activeReactionMsgId) {
-                                                // Insert mode - add emoji to message text
-                                                messageInput.text += modelData;
-                                                messageInput.forceActiveFocus();
-                                            }
-                                            root.emojiPickerVisible = false;
-                                            root.activeReactionMsgId = "";
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Category Tabs Bar
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 32
-                        color: root.colSurface
-
-                        RowLayout {
-                            anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-                            spacing: 2
-
-                            Repeater {
-                                model: ["⭐", "😀", "👋", "🐶", "🍎", "🚗", "⚽", "💡"]
-                                Rectangle {
-                                    height: 26
-                                    width: 32
-                                    radius: 4
-                                    color: index === root.selectedEmojiCategory ? root.colAccentDim : (catHover.containsMouse ? root.colPanel : "transparent")
-                                    border.color: index === root.selectedEmojiCategory ? root.colAccent : "transparent"
-                                    border.width: 1
-
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData
-                                        font.pointSize: 12
-                                        font.family: root.emojiFont
-                                        renderType: Text.QtRendering
-                                    }
-
-                                    MouseArea {
-                                        id: catHover
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onClicked: root.selectedEmojiCategory = index
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                    // Scrolling vertical emoji grid
-                    PlasmaComponents.ScrollView {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-
-                        GridView {
-                            id: emojiGrid
-                            anchors.fill: parent
-                            anchors.margins: 4
-                            cellWidth: 38
-                            cellHeight: 38
-                            flow: GridView.FlowLeftToRight
-                            clip: true
-
-                            model: {
-                                if (root.selectedEmojiCategory === 0) return root.emojiList;
-                                if (root.selectedEmojiCategory === 1) return root.emojiList.slice(0, 80);
-                                if (root.selectedEmojiCategory === 2) return root.emojiList.slice(80, 160);
-                                if (root.selectedEmojiCategory === 3) return root.emojiList.slice(220, 310);
-                                if (root.selectedEmojiCategory === 4) return root.emojiList.slice(310, 410);
-                                if (root.selectedEmojiCategory === 5) return root.emojiList.slice(410, 500);
-                                if (root.selectedEmojiCategory === 6) return root.emojiList.slice(500, 563);
-                                if (root.selectedEmojiCategory === 7) return root.emojiList.slice(563);
-                                return root.emojiList;
-                            }
-
-                            delegate: Rectangle {
-                                width: 36; height: 36
-                                color: emojiItemHover.containsMouse ? root.colAccentDim : "transparent"
-                                radius: 4
-
-                                Behavior on color { ColorAnimation { duration: 80 } }
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: modelData
-                                    font.pointSize: 16
-                                    font.family: root.emojiFont
-                                    renderType: Text.QtRendering
-                                }
-
-                                MouseArea {
-                                    id: emojiItemHover
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        if (root.activeReactionMsgId && root.activeChat) {
-                                            root.sendReaction(root.activeChat.id, root.activeReactionMsgId, modelData);
-                                        } else if (!root.activeReactionMsgId) {
-                                            // Insert mode - add emoji to message text
-                                            messageInput.text += modelData;
-                                            messageInput.forceActiveFocus();
-                                        }
-                                        root.emojiPickerVisible = false;
-                                        root.activeReactionMsgId = "";
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            rootItem: root
         }
+
     }
-    // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
+    // ── Fullscreen media viewer (MediaViewerOverlay.qml) ────────────────────
     // Pinch-zoom/pan for images and stickers with prev/next navigation.
     // NOTE: QtMultimedia is not available in this plasmoid sandbox (Slice 0
     // spike), so video messages render their base64 preview enlarged with an
     // "open on phone" note instead of inline playback.
-    Rectangle {
-        id: mediaViewer
+    MediaViewerOverlay {
         anchors.fill: parent
-        z: 100
-        visible: root.viewerVisible
-        color: "#000000"
-        focus: visible
-        Keys.onEscapePressed: root.closeMediaViewer()
-        Keys.onLeftPressed: root.viewerStep(-1)
-        Keys.onRightPressed: root.viewerStep(1)
-
-        function currentMsg() {
-            if (!root.mediaList || root.mediaList.length === 0) return null;
-            var i = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
-            return root.mediaList[i];
-        }
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
-
-            // Header: counter + close
-            Rectangle {
-                Layout.fillWidth: true
-                height: 44
-                color: "#cc000000"
-
-                RowLayout {
-                    anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
-                    spacing: 8
-
-                    PlasmaComponents.Label {
-                        text: root.mediaList.length > 0
-                              ? (Math.min(root.mediaIndex, root.mediaList.length - 1) + 1) + " of " + root.mediaList.length
-                              : ""
-                        color: "#ffffff"
-                        font.pointSize: 9
-                        Layout.fillWidth: true
-                    }
-
-                    PlasmaComponents.ToolButton {
-                        icon.name: "dialog-close"
-                        display: PlasmaComponents.ToolButton.IconOnly
-                        onClicked: root.closeMediaViewer()
-                    }
-                }
-            }
-
-            // Stage: pinch-zoom + drag-pan; click closes, double-click resets,
-            // drag down dismisses.
-            Item {
-                id: viewerStage
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                property real vScale: 1.0
-                property real vTx: 0
-                property real vTy: 0
-                function reset() { vScale = 1.0; vTx = 0; vTy = 0; }
-
-                Image {
-                    id: viewerImage
-                    anchors.centerIn: parent
-                    source: {
-                        var m = mediaViewer.currentMsg();
-                        return m ? MsgUtils.mediaSource(m) : "";
-                    }
-                    fillMode: Image.PreserveAspectFit
-                    scale: viewerStage.vScale
-                    transform: Translate { x: viewerStage.vTx; y: viewerStage.vTy }
-                    asynchronous: true
-
-                    PlasmaComponents.Label {
-                        anchors.centerIn: parent
-                        visible: {
-                            var m = mediaViewer.currentMsg();
-                            return !!m && m.type === "video";
-                        }
-                        text: "🎥 Video — open on phone to play"
-                        color: "#ffffff"
-                        font.pointSize: 9
-                        style: Text.Outline
-                        styleColor: "#80000000"
-                    }
-                }
-
-                PinchArea {
-                    anchors.fill: parent
-                    onPinchUpdated: {
-                        viewerStage.vScale = Math.min(4, Math.max(0.5, viewerStage.vScale * pinch.scale));
-                    }
-                    MouseArea {
-                        id: viewerPan
-                        anchors.fill: parent
-                        property real lastX: 0
-                        property real lastY: 0
-                        property real startY: 0
-                        property bool moved: false
-                        onPressed: function(mouse) {
-                            lastX = mouse.x; lastY = mouse.y; startY = mouse.y; moved = false;
-                        }
-                        onPositionChanged: function(mouse) {
-                            var dx = mouse.x - lastX;
-                            var dy = mouse.y - lastY;
-                            if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
-                            if (viewerStage.vScale > 1.05) {
-                                viewerStage.vTx += dx;
-                                viewerStage.vTy += dy;
-                            } else if (dy > 0 && mouse.y - startY > 80) {
-                                root.closeMediaViewer();   // swipe-down dismiss
-                            }
-                            lastX = mouse.x; lastY = mouse.y;
-                        }
-                        onClicked: if (!moved) root.closeMediaViewer()
-                        onDoubleClicked: viewerStage.reset()
-                    }
-                }
-            }
-
-                // Footer: prev / next + media label
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 52
-                    color: "#cc000000"
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
-                        spacing: 12
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-previous"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            visible: root.mediaList.length > 1
-                            onClicked: root.viewerStep(-1)
-                        }
-                        Item { Layout.fillWidth: true }
-                        PlasmaComponents.Label {
-                            text: {
-                                var m = mediaViewer.currentMsg();
-                                return m ? (MsgUtils.mediaLabel(m.type) || "📷 Media") : "";
-                            }
-                            color: "#ffffff"
-                            font.pointSize: 9
-                        }
-                        Item { Layout.fillWidth: true }
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-next"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            visible: root.mediaList.length > 1
-                            onClicked: root.viewerStep(1)
-                        }
-                    }
-                }
-        }
-
-        onVisibleChanged: {
-            if (visible) {
-                viewerStage.reset();
-                mediaViewer.forceActiveFocus();
-            }
-        }
+        rootItem: root
     }
 
-// Pure-QML clipboard helper (TextEdit.selectAll + copy)
-    TextEdit {
-        id: clipTextEdit
-        visible: false
-        width: 0; height: 0
+    // Hidden clipboard helper (ContextMenuButtons.qml). Exposed as a property so
+    // code in other files can reach it as `root.contextMenuButtons.clipEdit`.
+    readonly property alias contextMenuButtons: clipboardHelper
+    ContextMenuButtons {
+        id: clipboardHelper
+        rootItem: root
     }
 
-    // Right-click context menu for messages
-    Menu {
-        id: msgContextMenu
-        title: "Message"
-
-        MenuItem {
-            text: "Reply"
-            icon.name: "mail-reply-sender"
-            onClicked: root.startReplyFromContext()
-        }
-        MenuItem {
-            text: "Copy message"
-            icon.name: "edit-copy"
-            onClicked: root.copyContextMessage()
-        }
+    // Right-click context menus (Menus.qml). Exposed as a property so delegate code
+    // in other files can call `root.menus.<popup>.popup(...)`.
+    readonly property alias menus: menusObj
+    Menus {
+        id: menusObj
+        rootItem: root
     }
 
-    // Right-click context menu for chat list rows
-    Menu {
-        id: chatContextMenu
-        title: "Chat"
-
-        MenuItem {
-            text: (root.contextChat && root.isChatPinned(root.contextChat)) ? "Unpin Chat" : "Pin Chat"
-            icon.name: "bookmark-new"
-            onClicked: {
-                if (root.contextChat) {
-                    root.togglePinChat(root.contextChat.id);
-                }
-            }
-        }
-    }
+    // NOTE: fullRepresentation is Component-typed, so ids inside it are NOT
+    // visible to root-level `property alias` (engine: "Unable to find id").
+    // Same-tree code reaches the compose bar as `sendBar.*` (the instance
+    // lives in MessagesPanel.qml); root-level code talks to it through root
+    // state (see recDotLit, messageInputRef).
 
     // "Copied" toast
     Timer {
         id: copyToastTimer
         interval: 1200
         onTriggered: root.copyToastVisible = false
+    }
+
+    // External-open status toast ("Opening…" while fetching full-res, error
+    // on failure); clears itself after a short delay so it never lingers.
+    Rectangle {
+        id: externalOpenToastPanel
+        visible: root.externalOpenToast !== ""
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 120
+        width: Math.max(160, toastText.implicitWidth + 32); height: 30; radius: 15
+        color: "#2a363c"
+        border.color: root.colBorder
+        border.width: 1
+        z: 99
+
+        PlasmaComponents.Label {
+            id: toastText
+            anchors.centerIn: parent
+            text: root.externalOpenToast
+            font.pointSize: 8
+            color: root.colText
+        }
+    }
+
+    Timer {
+        id: externalOpenToastTimer
+        interval: 3000
+        onTriggered: root.externalOpenToast = ""
     }
 
     Rectangle {
