@@ -325,6 +325,10 @@ function tick(root, cfg, timer, state) {
             forceEndStep(root, cfg, timer, state);
             break;
 
+        case "reopenAtLatest":
+            reopenAtLatestStep(root, cfg, timer, state, lv);
+            break;
+
         case "voiceSend":
             voiceSendStep(root, cfg, timer, state);
 
@@ -788,6 +792,98 @@ function viewerStep(root, cfg, timer, state) {
     var okClose = !root.viewerVisible;
     passFail(root, cfg, timer, state, okOpen && okStep && okClose,
         "viewer: " + n + " media, open=" + okOpen + " step=" + okStep + " close=" + okClose);
+}
+
+// Opening a chat must land on the newest message even when the previous chat
+// was left scrolled up (cold fetch) and when the chat paints instantly from
+// the MRU cache. Phases are bounded, so a chat that never loads reports which
+// phase stalled instead of a bare step timeout.
+function reopenAtLatestStep(root, cfg, timer, state, lv) {
+    if (!lv) {
+        if (state.tries > 50) passFail(root, cfg, timer, state, false, "message ListView not found");
+        return;
+    }
+    if (!root.activeChatMessages.length) return;
+    var s = state.saved;
+    var atEnd = function() { return lv.contentY >= lv.contentHeight - lv.height - 2; };
+    var where = function() {
+        return "y=" + Math.round(lv.contentY) + " ch=" + Math.round(lv.contentHeight) +
+               " h=" + Math.round(lv.height);
+    };
+    function phase(p) { s.phase = p; s.pt = 0; dbg("reopen phase " + p); }
+
+    if (s.phase === undefined) {
+        s.origin = root.activeChat.id;
+        lv.contentY = 150;                       // user reading older messages
+        s.cands = [];
+        var chats = root.allChats || [];
+        for (var i = 0; i < chats.length && s.cands.length < 4; i++) {
+            if (chats[i].id !== s.origin) s.cands.push(chats[i]);
+        }
+        phase(1);
+        return;
+    }
+    s.pt++;
+
+    if (s.phase === 1) {                         // closed-loop park: a settle can steal the write
+        if (Math.abs(lv.contentY - 150) > 25) {
+            lv.contentY = 150;
+            s.pt = 0;
+            return;
+        }
+        if (s.pt < 3) return;
+        s.candIdx = 0;
+        if (!s.cands.length) { passFail(root, cfg, timer, state, false, "no second chat to switch to"); return; }
+        switchTo(root, s.cands[0]);
+        phase(2);
+        return;
+    }
+
+    if (s.phase === 2) {                         // cold switch (no cache) -> newest
+        if (root.activeChat.id !== s.cands[s.candIdx].id) return;
+        if (root.activeChatMessages.length > 0) {
+            if (atEnd()) {
+                s.coldY = Math.round(lv.contentY);
+                root.activeChat = { id: s.origin, name: "origin", isGroup: false };
+                phase(3);
+                return;
+            }
+            if (s.pt > 20) passFail(root, cfg, timer, state, false,
+                "cold switch stayed off the newest message (" + where() + ")");
+            return;
+        }
+        // Empty chat: move on once its load settled (or it dawdles).
+        var settled = !root.isLoadingMessages && !root.messagesInFlight;
+        if ((settled || s.pt > 25) && !atEnd()) {
+            s.candIdx++;
+            if (s.candIdx >= s.cands.length) {
+                passFail(root, cfg, timer, state, false, "no chat with history to switch to");
+                return;
+            }
+            switchTo(root, s.cands[s.candIdx]);
+            phase(2);
+        }
+        return;
+    }
+
+    if (root.activeChat.id !== s.origin) return;  // phase 3: cached switch (MRU paint, then revalidate)
+    if (root.activeChatMessages.length > 0 && atEnd()) {
+        passFail(root, cfg, timer, state, true,
+            "chat switch lands on newest (cold y=" + s.coldY + ", cached " + where() + ")");
+        return;
+    }
+    if (s.pt > 20) passFail(root, cfg, timer, state, false,
+        "cached switch stayed off the newest message (" + where() + ")");
+}
+
+// Switch chats the way the chat list does, so the open path (MRU cache paint
+// plus revalidate fetch) runs for real.
+function switchTo(root, chat) {
+    root.activeChat = {
+        id: chat.id,
+        name: chat.name || chat.formattedTitle || "Unknown",
+        isGroup: chat.isGroup || false
+    };
 }
 
 // Node export (no-op; kept for lint parity with the other UI helpers).

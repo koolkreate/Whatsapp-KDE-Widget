@@ -6,7 +6,6 @@ import QtMultimedia
 import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components 3.0 as PlasmaComponents
-import QtQuick.Dialogs
 import "messageUtils.js" as MsgUtils
 import "pollingUtils.js" as PollUtils
 
@@ -56,6 +55,8 @@ PlasmoidItem {
     property var    contextReplyMsg: null  // message that was right-clicked
     property var    contextChat: null      // chat that was right-clicked
     property var    pinnedChats: []        // list of pinned chat IDs
+    property var    archivedChats: []      // archived chat IDs
+    property bool   showArchived: false    // chat list is showing archived chats
     property string pendingAttachmentPath: "" // pasted image waiting to be sent
     property bool   copyToastVisible: false
 
@@ -69,14 +70,12 @@ PlasmoidItem {
     property var    testCfg: null
     property Item   msgListViewRef: null  // captured by the ListView on completion
 
-    // Reliable access to the messages ListView: the `messageListView` id is
-    // not resolvable from every call path (XHR closures, imported JS), so
-    // code that scrolls must go through this helper.
+    // Reliable access to the messages ListView: the `messageListView` id lives
+    // in MessagesPanel.qml (Slice 7) and is not resolvable at root scope, so
+    // code that scrolls must go through this helper (backed by the
+    // `root.msgListViewRef` capture the ListView makes on completion).
     function getMsgListView() {
         if (root.msgListViewRef) return root.msgListViewRef;
-        try {
-            if (typeof messageListView !== "undefined" && messageListView) return messageListView;
-        } catch (e) { }
         return null;
     }
 
@@ -120,6 +119,36 @@ PlasmoidItem {
             if (root.pinnedChats[i] === cid) return true;
         }
         return false;
+    }
+
+    function isChatArchived(chat) {
+        if (!chat) return false;
+        // The backend-provided archivedChats list is authoritative; stale
+        // per-chat object flags are ignored so unarchive always takes effect.
+        var cid = (typeof chat === "string") ? chat : (chat.id || "");
+        if (!cid || !root.archivedChats) return false;
+        for (var i = 0; i < root.archivedChats.length; i++) {
+            if (String(root.archivedChats[i]) === String(cid)) return true;
+        }
+        return false;
+    }
+
+    // Cross-file entry point for ChatListPanel's search field: QML ids are
+    // not properties, so panels cannot reach `searchDebounceTimer` directly.
+    function restartSearchDebounce() {
+        searchDebounceTimer.restart();
+    }
+
+    function recomputeTotalUnread() {
+        var u = 0;
+        if (root.allChats) {
+            for (var i = 0; i < root.allChats.length; i++) {
+                if (!root.isChatArchived(root.allChats[i])) {
+                    u += root.allChats[i].unreadCount || 0;
+                }
+            }
+        }
+        root.totalUnread = u;
     }
 
     function sortAndFilterChats() {
@@ -171,6 +200,54 @@ PlasmoidItem {
         xhr.send(JSON.stringify({ args: { chatId: chatId } }));
     }
 
+    function fetchArchivedChats() {
+        if (!root.isConnected) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/getArchivedChats");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.archivedChats = r.response || [];
+                    root.recomputeTotalUnread();
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: {} }));
+    }
+
+    function setChatArchived(chatId, archived) {
+        if (!root.isConnected || !chatId) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", apiHost + "/api/setChatArchived");
+        xhr.setRequestHeader("Content-Type",  "application/json");
+        xhr.setRequestHeader("X-API-Key",     apiKey);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            if (xhr.status === 200) {
+                try {
+                    var r = JSON.parse(xhr.responseText);
+                    root.archivedChats = r.response || [];
+                    if (root.activeChat && String(root.activeChat.id) === String(chatId)
+                            && root.isChatArchived(chatId)) {
+                        root.activeChat = null;
+                    }
+                    if (root.showArchived && root.archivedChats.length === 0) {
+                        root.showArchived = false;
+                        root.chatsShown = 20;
+                    }
+                    root.recomputeTotalUnread();
+                    sortAndFilterChats();
+                } catch(e) { }
+            }
+        };
+        xhr.send(JSON.stringify({ args: { chatId: chatId, archived: archived } }));
+    }
+
     // Emoji-supporting font - use Noto Color Emoji if available, fallback to default
     readonly property string emojiFont: "Noto Color Emoji, emoji, monospace"
 
@@ -191,6 +268,7 @@ PlasmoidItem {
             root._waitGen++;
             root.waitLoopRunning = false;
             root._pendingOpenChatId = "";
+            root._pendingJumpEnd = true;
             root.mruTouch(activeChat.id);
             var cached = root.msgCache[activeChat.id];
             if (cached && cached.messages && cached.messages.length > 0) {
@@ -199,6 +277,7 @@ PlasmoidItem {
                 root.activeChatMessages = cached.messages;
                 root.msgsHasMore = true;
                 root.isLoadingMessages = false;
+                root.jumpToLatestPending();
                 fetchMessages(activeChat.id);
             } else {
                 root.activeChatMessages = [];
@@ -209,6 +288,7 @@ PlasmoidItem {
         } else {
             root.activeChatMessages = [];
             root.msgsHasMore = false;
+            root._pendingJumpEnd = false;
         }
     }
 
@@ -337,6 +417,7 @@ PlasmoidItem {
                         root.hasQrCode = false;
                         root.statusMessage = "";
                         fetchPinnedChats();
+                        fetchArchivedChats();
                         fetchChats();
                     } else {
                         root.isConnected = false;
@@ -408,10 +489,9 @@ PlasmoidItem {
                     root.allChats = chats;
                     root.chatsShown = 20;
                     root.authFailStreak = 0;
-                    var u = 0;
-                    for (var i = 0; i < chats.length; i++) u += chats[i].unreadCount || 0;
-                    root.totalUnread = u;
+                    root.recomputeTotalUnread();
                     sortAndFilterChats();
+                    fetchArchivedChats(); // keep a second widget instance in sync
                     fetchAvatars();
                 } catch(e) {
                     console.log("Parse error:", e);
@@ -668,6 +748,10 @@ PlasmoidItem {
     property string restoreMode: ""     // "end" | "anchor" | "" (no settle running)
     property string restoreChat: ""     // chat id the running settle serves
     property string _pendingOlderFetch: "" // older-page fetch queued behind an in-flight poll
+    // Set when a chat is (re)opened: the first payload — cold fetch or MRU
+    // cache paint — must land on the newest message, regardless of where the
+    // previous chat was left scrolled.
+    property bool _pendingJumpEnd: false
 
     // Locate an instantiated message-bubble delegate by message id.
     function findBubbleDelegateIn(item, msgId) {
@@ -755,6 +839,21 @@ PlasmoidItem {
             root.fetchOlderMessages();
         });
     }
+    // Land on the newest message once, right after a chat switch. Consumes the
+    // pending flag so later merges keep the user's reading position, and runs
+    // the end-settle loop (not a bare positionViewAtEnd) so the jump still
+    // wins when delegate heights are not final yet.
+    function jumpToLatestPending() {
+        if (!root._pendingJumpEnd) return;
+        root._pendingJumpEnd = false;
+        if (root.activeChatMessages.length === 0) return;
+        Qt.callLater(function() {
+            var lv = root.getMsgListView();
+            if (!lv || lv.count === 0) return;
+            root.restoreAtEndSettle(lv);
+        });
+    }
+
     function restoreAtEndSettle(lv, retries) {
         if (!lv) return;
         retries = retries || 0;
@@ -865,7 +964,11 @@ PlasmoidItem {
 
     function applyMessagesModel(msgs) {
         var lv = root.getMsgListView();
-        var userAtEnd = lv ? (root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically) : true;
+        // A chat switch overrides the previous chat's scroll state: the first
+        // payload must land on the newest message.
+        var jumpEnd = root._pendingJumpEnd;
+        if (jumpEnd) root._pendingJumpEnd = false;
+        var userAtEnd = jumpEnd || (lv ? (root.isAtEnd(lv) && !lv.draggingVertically && !lv.flickingVertically) : true);
         var anchor = { id: "", off: 0 };
         var prevY = 0;
         if (lv) {
@@ -1326,6 +1429,9 @@ PlasmoidItem {
     property string voicePath: ""
     property int voiceSecs: 0
     property string voiceError: ""
+    // Blink phase for the recording dot (lives in SendMessageBar.qml, which
+    // root-level code cannot reach by id — see note at the alias block).
+    property bool recDotLit: true
 
     CaptureSession {
         id: voiceCapture
@@ -1349,7 +1455,7 @@ PlasmoidItem {
         running: false
         onTriggered: {
             root.voiceSecs++;
-            recDot.opacity = recDot.opacity > 0.5 ? 0.25 : 1.0;
+            root.recDotLit = !root.recDotLit;
         }
     }
 
@@ -1376,6 +1482,7 @@ PlasmoidItem {
         var plain = String(dir).replace(/\/$/, "") + "/wa-voicenote-" + Date.now() + ".ogg";
         root.voicePath = plain;
         root.voiceSecs = 0;
+        root.recDotLit = true;
         root.voiceError = "";
         try {
             voiceRecorder.outputLocation = "file://" + plain;
@@ -1834,18 +1941,17 @@ PlasmoidItem {
         }
     }
 
+    function toggleArchivedView() {
+        root.showArchived = !root.showArchived;
+        root.searchQuery = "";
+        root.chatsShown = 20;
+        filterChats();
+    }
+
     function filterChats() {
         if (!root.allChats || root.allChats.length === 0) { root.filteredChats = []; return; }
-        var q = root.searchQuery.trim().toLowerCase();
-        if (q === "") { root.filteredChats = root.allChats; return; }
-        var res = [];
-        for (var i = 0; i < root.allChats.length; i++) {
-            var c = root.allChats[i];
-            var n = (c.name || c.formattedTitle || "").toLowerCase();
-            var phone = ((c.id || "").split("@")[0] || "").toLowerCase();
-            if (n.indexOf(q) !== -1 || phone.indexOf(q) !== -1) res.push(c);
-        }
-        root.filteredChats = res;
+        root.filteredChats = MsgUtils.filterChats(root.allChats, root.searchQuery,
+                                                  root.archivedChats, root.showArchived);
     }
 
     // ── Commonly used emojis for picker ──────────────────────────────────────────────────
@@ -1933,19 +2039,6 @@ PlasmoidItem {
         onTriggered: filterChats()
     }
 
-    FileDialog {
-        id: fileDialog
-        title: "Select an attachment"
-        nameFilters: [
-            "Images and Media (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.mp4 *.mov *.avi)",
-            "All Files (*)"
-        ]
-        onAccepted: {
-            if (root.activeChat && selectedFile) {
-                sendFile(root.activeChat.id, selectedFile.toString());
-            }
-        }
-    }
 
     // ── Compact representation ────────────────────────────────────────────────
     compactRepresentation: Item {
@@ -2174,1767 +2267,33 @@ PlasmoidItem {
                 }
             }
 
-            // ═══════════════════════════════════════════════════
-            // PAGE 1 — Chat List
-            // ═══════════════════════════════════════════════════
-            ColumnLayout {
-                spacing: 0
-
-                // ── Header bar ─────────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 56
-                    color: root.colHeader
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 14; rightMargin: 10; topMargin: 8; bottomMargin: 8 }
-                        spacing: 10
-
-                        // WA logo
-                        Rectangle {
-                            width: 36; height: 36; radius: 18
-                            color: root.colAccent
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                text: "💬"
-                                font.pointSize: 16
-                            }
-                        }
-
-                        PlasmaComponents.Label {
-                            text: "WhatsApp Quick"
-                            font.bold: true
-                            font.pointSize: 13
-                            color: root.colText
-                            Layout.fillWidth: true
-                        }
-
-                        // Loading spinner (small)
-                        Rectangle {
-                            visible: root.isLoading
-                            width: 20; height: 20; radius: 10
-                            color: "transparent"
-                            border.color: root.colAccent
-                            border.width: 2
-                            RotationAnimation on rotation {
-                                from: 0; to: 360; duration: 1000
-                                loops: Animation.Infinite; running: root.isLoading
-                            }
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "view-refresh"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Refresh chats"
-                            ToolTip.visible: hovered
-                            onClicked: fetchChats()
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "system-reboot"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Restart WhatsApp Connection"
-                            ToolTip.visible: hovered
-                            onClicked: restartBackend()
-                        }
-                    }
-                }
-
-                // ── Search box ─────────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 44
-                    color: root.colPanel
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-                        spacing: 6
-
-                        PlasmaComponents.Label { text: "🔍"; font.pointSize: 11 }
-
-                        PlasmaComponents.TextField {
-                            id: searchBar
-                            placeholderText: "Search name or number…"
-                            Layout.fillWidth: true
-                            color: root.colText
-                            background: Item {}
-                            onTextChanged: { root.searchQuery = text; searchDebounceTimer.restart(); }
-                        }
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "edit-clear"
-                            visible: searchBar.text.length > 0
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            onClicked: { searchBar.text = ""; root.searchQuery = ""; filterChats(); }
-                        }
-                    }
-                }
-
-                // ── Separator ──────────────────────────────────
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Chat list: bare ListView with an attached scrollbar,
-                // same reason as the message history below — the ListView
-                // itself must own contentY/atYEnd.
-                ListView {
-                    id: chatListView
-                    objectName: "chatListView"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-                    ScrollBar.vertical: ScrollBar {
-                        policy: ScrollBar.AsNeeded
-                        background: Item {}
-                    }
-                    model: root.filteredChats.slice(0, root.chatsShown)
-                        spacing: 0
-                        // NOTE: deliberately NO reuseItems here (same lesson
-                        // as messageListView below). The model is a JS array
-                        // that is replaced on every refresh, and recycling
-                        // keeps stale bindings — rendering ghosted,
-                        // double-painted titles/timestamps in chat rows.
-
-                        // Infinite scroll: grow the window when the user hits
-                        // the bottom of the rendered chats.
-                        onAtYEndChanged: {
-                            if (atYEnd && root.filteredChats.length > root.chatsShown) {
-                                root.chatsShown += 20;
-                            }
-                        }
-
-                        // Empty state
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: root.filteredChats.length === 0 && !root.isLoading
-                            text: root.searchQuery ? "No results for \"" + root.searchQuery + "\"" : "No chats found"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        delegate: Rectangle {
-                            id: chatRow
-                            width: chatListView.width
-                            height: 68
-                            color: hovered ? root.colPanel : "transparent"
-
-                            property bool hovered: false
-                            MouseArea {
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                onEntered: chatRow.hovered = true
-                                onExited:  chatRow.hovered = false
-                                onClicked: function(mouse) {
-                                    if (mouse.button === Qt.RightButton) {
-                                        root.contextChat = modelData;
-                                        root.menus.chatContextMenu.popup(chatRow, mouse.x, mouse.y);
-                                    } else {
-                                        root.activeChat = {
-                                            id:      modelData.id,
-                                            name:    modelData.name || modelData.formattedTitle || "Unknown",
-                                            isGroup: modelData.isGroup || false
-                                        };
-                                    }
-                                }
-                            }
-
-                            Behavior on color { ColorAnimation { duration: 120 } }
-
-                            RowLayout {
-                                anchors { fill: parent; leftMargin: 14; rightMargin: 14 }
-                                spacing: 12
-
-                                // Avatar (profile picture with colored-initials fallback)
-                                Rectangle {
-                                    width: 44; height: 44; radius: 22
-                                    color: root.avatarColor(modelData.name || modelData.formattedTitle || "")
-
-                                    PlasmaComponents.Label {
-                                        anchors.centerIn: parent
-                                        text: modelData.isGroup ? "👥" : root.chatInitial(modelData)
-                                        font.bold: !modelData.isGroup
-                                        font.pointSize: modelData.isGroup ? 20 : 16
-                                        color: "#ffffff"
-                                    }
-
-                                    // Circular mask for the photo (white = visible).
-                                    Rectangle {
-                                        id: avatarMaskShape
-                                        width: 44; height: 44; radius: 22
-                                        visible: false
-                                        color: "#ffffff"
-                                    }
-
-                                    // Avatar photo on top when available.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: root.avatarSource(modelData.id)
-                                        sourceSize.width: 88
-                                        sourceSize.height: 88
-                                        asynchronous: true
-                                        fillMode: Image.PreserveAspectCrop
-                                        visible: source !== ""
-                                        layer.enabled: source !== ""
-                                        layer.smooth: true
-                                        layer.effect: MultiEffect {
-                                            maskEnabled: true
-                                            maskSource: avatarMaskShape
-                                        }
-                                    }
-
-                                    // Online indicator (if available)
-                                    Rectangle {
-                                        visible: !modelData.isGroup && (modelData.isOnline || false)
-                                        width: 12; height: 12; radius: 6
-                                        color: root.colGreen
-                                        border.color: root.colBg
-                                        border.width: 2
-                                        anchors { bottom: parent.bottom; right: parent.right }
-                                    }
-                                }
-
-                                // Text block
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 2
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 4
-
-                                        PlasmaComponents.Label {
-                                            visible: root.isChatPinned(modelData)
-                                            text: "📌"
-                                            font.pointSize: 8
-                                        }
-
-                                        PlasmaComponents.Label {
-                                            text: modelData.name || modelData.formattedTitle || "Unknown"
-                                            font.bold: true
-                                            font.pointSize: 10
-                                            color: root.colText
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
-                                        }
-
-                                        PlasmaComponents.Label {
-                                            text: root.formatTime(modelData.t || (modelData.lastMessage && modelData.lastMessage.t) || 0)
-                                            font.pointSize: 8
-                                            color: (modelData.unreadCount || 0) > 0 ? root.colGreen : root.colSub
-                                        }
-                                    }
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 4
-
-                                        PlasmaComponents.Label {
-                                            text: root.lastPreview(modelData)
-                                            font.pointSize: 8.5
-                                            color: root.colSub
-                                            elide: Text.ElideRight
-                                            maximumLineCount: 1
-                                            wrapMode: Text.NoWrap
-                                            Layout.fillWidth: true
-                                        }
-
-                                        // Unread badge
-                                        Rectangle {
-                                            visible: (modelData.unreadCount || 0) > 0
-                                            width:  Math.max(20, unreadLabel.implicitWidth + 8)
-                                            height: 20
-                                            radius: 10
-                                            color:  root.colGreen
-
-                                            PlasmaComponents.Label {
-                                                id: unreadLabel
-                                                anchors.centerIn: parent
-                                                text: (modelData.unreadCount || 0) > 99 ? "99+" : (modelData.unreadCount || "")
-                                                font.pointSize: 7
-                                                font.bold: true
-                                                color: "#ffffff"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Bottom divider
-                            Rectangle {
-                                anchors { bottom: parent.bottom; left: parent.left; right: parent.right; leftMargin: 70 }
-                                height: 1
-                                color: root.colBorder
-                                opacity: 0.5
-                            }
-                        }
-                }
+            // ── Page 1: chat list (ChatListPanel.qml) ──────────────────────────
+            ChatListPanel {
+                rootItem: root
             }
 
-            // ═══════════════════════════════════════════════════
-            // PAGE 2 — Compose Message
-            // ═══════════════════════════════════════════════════
-            ColumnLayout {
-                spacing: 0
-
-                // ── Compose header ─────────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 60
-                    color: root.colHeader
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 6; rightMargin: 14 }
-                        spacing: 8
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-previous"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Back to chats"
-                            ToolTip.visible: hovered
-                            onClicked: root.activeChat = null
-                        }
-
-                        // Recipient avatar (photo with initials fallback)
-                        Rectangle {
-                            width: 38; height: 38; radius: 19
-                            color: root.activeChat ? root.avatarColor(root.activeChat.name) : root.colAccent
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                text: root.activeChat ? (root.activeChat.isGroup ? "👥" : root.activeChat.name.charAt(0).toUpperCase()) : "?"
-                                font.bold: !root.activeChat || !root.activeChat.isGroup
-                                font.pointSize: root.activeChat && root.activeChat.isGroup ? 18 : 14
-                                color: "#ffffff"
-                            }
-
-                            Rectangle {
-                                id: headerAvatarMask
-                                width: 38; height: 38; radius: 19
-                                visible: false
-                                color: "#ffffff"
-                            }
-
-                            Image {
-                                anchors.fill: parent
-                                source: root.activeChat ? root.avatarSource(root.activeChat.id) : ""
-                                sourceSize.width: 76
-                                sourceSize.height: 76
-                                asynchronous: true
-                                fillMode: Image.PreserveAspectCrop
-                                visible: source !== ""
-                                layer.enabled: source !== ""
-                                layer.smooth: true
-                                layer.effect: MultiEffect {
-                                    maskEnabled: true
-                                    maskSource: headerAvatarMask
-                                }
-                            }
-                        }
-
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 1
-
-                            PlasmaComponents.Label {
-                                text: root.activeChat ? root.activeChat.name : ""
-                                font.bold: true
-                                font.pointSize: 11
-                                color: root.colText
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-                            // "Updating…" cue while a revalidate/poll is in
-                            // flight over an already-rendered list (MRU cache
-                            // hits must visibly refresh, never sit stale).
-                            PlasmaComponents.Label {
-                                visible: root.messagesInFlight && root.activeChatMessages.length > 0
-                                text: "Updating…"
-                                font.pointSize: 7.5
-                                color: root.colSub
-                            }
-                            // Subtitle (JID/phone number) intentionally hidden —
-                            // the raw WhatsApp ID under the name was visual noise.
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Message History: bare ListView with an attached
-                // scrollbar. A ListView nested in a ScrollView fights it
-                // for scrolling (stale contentY, dead atYEnd), so the
-                // ListView itself is the scroller here.
-                ListView {
-                    id: messageListView
-                    objectName: "messageListView"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    ScrollBar.vertical: ScrollBar {
-                        policy: ScrollBar.AsNeeded
-                        background: Item {}
-                    }
-                    Component.onCompleted: {
-                        root.msgListViewRef = messageListView;
-                    }
-                    model: root.activeChatMessages
-                        spacing: 4
-                        clip: true
-                        // NOTE: deliberately NO reuseItems here. This delegate's
-                        // height comes from chained implicitHeight bindings
-                        // (bubble → wrapping Text → anchored layouts), and the
-                        // model is a JS array that is replaced on every merge.
-                        // Item recycling keeps stale sizes/bindings and renders
-                        // overlapping, overflowing bubbles.
-
-                        // Always land on the most recent message — but only
-                        // when the user is already at (or near) the bottom AND
-                        // not mid-gesture, so background updates and temp-send
-                        // appends never yank the scroll position ("teleport").
-                        // swapInFlight must be excluded: during a model swap
-                        // contentHeight collapses to ~0, which flips atYEnd
-                        // true spuriously and would yank the view to the end
-                        // right over the anchor restore that follows.
-                        onCountChanged: {
-                            if (count > 0 && root.isAtEnd(messageListView) && !root.swapInFlight &&
-                                !draggingVertically && !flickingVertically)
-                                Qt.callLater(messageListView.positionViewAtEnd);
-                        }
-                        onWidthChanged: if (count > 0) Qt.callLater(messageListView.positionViewAtEnd);
-
-                        // Top-edge lazy loading: fetch 20 older messages when
-                        // the user scrolls to the very top. swapInFlight and
-                        // anchorHold must be excluded: during a model swap or
-                        // a scroll-restore settle the view can transiently sit
-                        // at contentY≈0, which would chain-load page after page
-                        // on every merge instead of on real user scrolls.
-                        onAtYBeginningChanged: {
-                            if (atYBeginning && root.isAtBeginning(messageListView) && !root.swapInFlight && !root.anchorHold &&
-                                root.msgsHasMore && !root.msgsLoadingOlder &&
-                                root.msgsTopError === "" && contentY < 200 &&
-                                root.activeChatMessages.length > 0) {
-                                root.fetchOlderMessages();
-                            }
-                        }
-
-                        header: Item {
-                            width: messageListView.width
-                            height: (root.msgsLoadingOlder || root.msgsTopError !== "") ? 36 : 0
-                            visible: height > 0
-
-                            PlasmaComponents.Label {
-                                anchors.centerIn: parent
-                                visible: root.msgsLoadingOlder
-                                text: "Loading older messages…"
-                                color: root.colSub
-                                font.pointSize: 8
-                            }
-
-                            RowLayout {
-                                anchors.centerIn: parent
-                                spacing: 8
-                                visible: root.msgsTopError !== ""
-
-                                PlasmaComponents.Label {
-                                    text: root.msgsTopError
-                                    color: root.colSub
-                                    font.pointSize: 8
-                                }
-
-                                PlasmaComponents.Label {
-                                    text: "↻ Retry"
-                                    color: root.colAccent
-                                    font.pointSize: 8.5
-
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.fetchOlderMessages()
-                                    }
-                                }
-                            }
-                        }
-
-                        // Placeholder if loading messages
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: root.isLoadingMessages && root.activeChatMessages.length === 0
-                            text: "Loading messages…"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        // Placeholder if no messages
-                        PlasmaComponents.Label {
-                            anchors.centerIn: parent
-                            visible: !root.isLoadingMessages && root.activeChatMessages.length === 0
-                            text: "No messages in this chat"
-                            color: root.colSub
-                            font.pointSize: 10
-                        }
-
-                        delegate: Item {
-                            id: msgDelegateRoot
-                            width: messageListView.width
-                            // Use the column's full implicit height + padding for
-                            // the reaction button that overflows below the bubble.
-                            height: systemText !== ""
-                                    ? sysLabel.implicitHeight + 8
-                                    : msgBubbleCol.implicitHeight + 16
-
-                            // Media-with-caption plumbing. WhatsApp puts the
-                            // caption text in `body`; a photo/video/sticker
-                            // bubble must render that text BELOW the image
-                            // (previously the caption silently disappeared).
-                            property bool isVisualMedia: modelData.type === "image" || modelData.type === "sticker" || modelData.type === "video" || !!modelData.thumbUrl || (modelData.body && MsgUtils.isMediaBody(modelData.body))
-                            property string mediaCaption: {
-                                if (!isVisualMedia) return "";
-                                var cap = (typeof modelData.caption === "string" && modelData.caption)
-                                    || modelData.body || "";
-                                if (typeof cap !== "string" || MsgUtils.isMediaBody(cap)) return "";
-                                return cap;
-                            }
-
-                            // System / non-renderable rows (call logs, deleted
-                            // messages, group notices): without this branch the
-                            // bubble collapsed to a timestamp-only pill.
-                            property string systemText: MsgUtils.systemMessageText(modelData)
-
-                            // Test hooks for the agent test workflow (agent_test.sh).
-                            objectName: "msgBubbleDelegate"
-                            property string testMsgId: String(modelData.id || "")
-                            property bool   testHasCaption: msgCaption.visible && msgCaption.text !== ""
-                            property string testCaptionText: msgCaption.text
-                            property bool   testBodyVisible: msgText.visible
-                            property bool   testHasAudio: msgAudio.visible
-                            property string testAudioDuration: audioTimeLabel.text
-                            property int    testWaveBars: waveRow.barCount
-
-                            // Right-click a message -> context menu (Reply / Copy message)
-                            MouseArea {
-                                anchors.fill: parent
-                                acceptedButtons: Qt.RightButton
-                                enabled: systemText === ""
-                                onClicked: function(mouse) {
-                                    root.contextReplyMsg = modelData;
-                                    root.menus.msgContextMenu.popup(msgDelegateRoot, mouse.x, mouse.y);
-                                }
-                            }
-
-                            ColumnLayout {
-                                id: msgBubbleCol
-                                anchors { left: parent.left; right: parent.right }
-                                spacing: 0
-
-                                // System / non-renderable message (call log,
-                                // deleted message, group notice): centered gray
-                                // text row instead of a chat bubble.
-                                PlasmaComponents.Label {
-                                    id: sysLabel
-                                    visible: systemText !== ""
-                                    text: systemText
-                                    color: root.colSub
-                                    font.pointSize: 8.5
-                                    wrapMode: Text.Wrap
-                                    horizontalAlignment: Text.AlignHCenter
-                                    Layout.alignment: Qt.AlignHCenter
-                                    Layout.maximumWidth: parent.width * 0.9
-                                }
-
-                                RowLayout {
-                                    id: bubbleRow
-                                    visible: systemText === ""
-                                    spacing: 8
-                                    layoutDirection: modelData.fromMe ? Qt.RightToLeft : Qt.LeftToRight
-
-                                    Item { width: 6 }
-
-                                    Rectangle {
-                                        id: msgBubble
-                                        width: {
-                                            var w = msgTime.implicitWidth + 30;
-                                            if (msgText.visible) {
-                                                w = Math.max(w, msgText.implicitWidth + 20);
-                                            } else if (msgAudio.visible) {
-                                                w = Math.max(w, Math.min(messageListView.width * 0.7, 250));
-                                            } else if (msgImage.visible || msgCaption.visible) {
-                                                // Media bubble: at least image
-                                                // width, scaled up to fit the
-                                                // caption text.
-                                                w = Math.max(w, Math.min(messageListView.width * 0.7, 240));
-                                                if (msgCaption.visible) {
-                                                    w = Math.max(w, Math.min(msgCaption.implicitWidth + 20, messageListView.width * 0.7));
-                                                }
-                                            }
-                                            return Math.min(messageListView.width * 0.75, w);
-                                        }
-                                        implicitHeight: msgCol.implicitHeight + 12
-                                        Layout.preferredHeight: implicitHeight
-                                        radius: 8
-                                        color: modelData.fromMe ? "#005c4b" : root.colPanel
-                                        border.color: root.colBorder
-                                        border.width: 1
-
-                                        ColumnLayout {
-                                            id: msgCol
-                                            anchors { fill: parent; margins: 8; topMargin: 6; bottomMargin: 6 }
-                                            spacing: 3
-
-                                            // Sender name (for groups)
-                                            PlasmaComponents.Label {
-                                                visible: root.activeChat && root.activeChat.isGroup && !modelData.fromMe && modelData.senderName
-                                                text: modelData.senderName || ""
-                                                font.pointSize: 7.5
-                                                font.bold: true
-                                                color: root.colGreen
-                                                Layout.fillWidth: true
-                                                elide: Text.ElideRight
-                                            }
-
-                                            // Quoted message preview (reply context)
-                                            Rectangle {
-                                                visible: !!(modelData.quotedMsg && modelData.quotedMsg.body)
-                                                Layout.fillWidth: true
-                                                Layout.preferredHeight: quotedCol.implicitHeight + 10
-                                                radius: 4
-                                                color: modelData.fromMe ? "#0a4639" : "#1a2930"
-                                                clip: true
-
-                                                // Green left accent bar
-                                                Rectangle {
-                                                    width: 3
-                                                    anchors { top: parent.top; bottom: parent.bottom; left: parent.left; leftMargin: 0 }
-                                                    radius: 1.5
-                                                    color: root.colAccent
-                                                }
-
-                                                ColumnLayout {
-                                                    id: quotedCol
-                                                    anchors { fill: parent; leftMargin: 8; rightMargin: 6; topMargin: 5; bottomMargin: 5 }
-                                                    spacing: 1
-
-                                                    PlasmaComponents.Label {
-                                                        visible: !!(modelData.quotedMsg && modelData.quotedMsg.senderName)
-                                                        text: (modelData.quotedMsg && modelData.quotedMsg.senderName) || ""
-                                                        font.pointSize: 7
-                                                        font.bold: true
-                                                        color: root.colAccent
-                                                        elide: Text.ElideRight
-                                                        Layout.fillWidth: true
-                                                    }
-
-                                                    PlasmaComponents.Label {
-                                                        text: {
-                                                            if (!modelData.quotedMsg) return "";
-                                                            var qType = modelData.quotedMsg.type || "chat";
-                                                            if (qType === "image") return "📷 Photo";
-                                                            if (qType === "video") return "🎥 Video";
-                                                            if (qType === "audio") return "🎵 Audio";
-                                                            if (qType === "sticker") return "🪄 Sticker";
-                                                            if (qType === "document") return "📄 Document";
-                                                            var b = modelData.quotedMsg.body || "";
-                                                            return b.length > 80 ? b.substring(0, 80) + "…" : b;
-                                                        }
-                                                        font.pointSize: 7.5
-                                                        color: root.colSub
-                                                        elide: Text.ElideRight
-                                                        wrapMode: Text.NoWrap
-                                                        Layout.fillWidth: true
-                                                        maximumLineCount: 1
-                                                    }
-                                                }
-                                            }
-
-                                            // Message text - with emoji font support.
-                                            // Hidden for photo/video/sticker bubbles
-                                            // (their caption renders below the image)
-                                            // and when the body IS the media bytes.
-                                            Text {
-                                                id: msgText
-                                                visible: !msgDelegateRoot.isVisualMedia && !MsgUtils.isMediaBody(modelData.body) && !MsgUtils.isAudioMessage(modelData)
-                                                text: modelData.body || ""
-                                                color: root.colText
-                                                font.pointSize: 9.5
-                                                font.family: root.emojiFont
-                                                wrapMode: Text.Wrap
-                                                Layout.fillWidth: true
-                                                renderType: Text.QtRendering
-                                            }
-
-                                            Image {
-                                                id: msgImage
-                                                visible: (!modelData._thumb || modelData.thumbUrl) && msgDelegateRoot.isVisualMedia
-                                                source: {
-                                                    if (!visible) return "";
-                                                    return MsgUtils.mediaPreviewSource(modelData);
-                                                }
-                                                fillMode: Image.PreserveAspectFit
-                                                Layout.maximumWidth: messageListView.width * 0.7
-                                                Layout.preferredWidth: Math.min(messageListView.width * 0.7, 240)
-                                                Layout.preferredHeight: Math.min(messageListView.width * 0.7, 180)
-                                                asynchronous: true
-
-                                                // Lazy 480p thumb: fetch once when the
-                                                // delegate becomes visible.
-                                                onVisibleChanged: {
-                                                    if (visible) root.requestThumb(modelData);
-                                                }
-                                                Component.onCompleted: {
-                                                    if (visible) root.requestThumb(modelData);
-                                                }
-
-                                                // Tap opens the image directly in
-                                                // the system viewer (xdg-open);
-                                                // video keeps the in-app viewer
-                                                // with its "open on phone" note.
-                                                MouseArea {
-                                                    anchors.fill: parent
-                                                    onClicked: {
-                                                        if (modelData.type === "video") {
-                                                            var list = MsgUtils.buildMediaList(root.activeChatMessages);
-                                                            var idx = -1;
-                                                            for (var i = 0; i < list.length; i++) {
-                                                                if (list[i].id === modelData.id) { idx = i; break; }
-                                                            }
-                                                            root.openMediaViewer(idx);
-                                                            return;
-                                                        }
-                                                        root.openExternallyMsg(modelData);
-                                                    }
-                                                }
-                                            }
-
-                                            // MRU cached-copy placeholder for large
-                                            // media (thumbnailized); the full body
-                                            // returns after revalidation.
-                                            PlasmaComponents.Label {
-                                                visible: !!modelData._thumb && !modelData.thumbUrl
-                                                text: MsgUtils.mediaLabel(modelData.type) || "📷 Media"
-                                                font.pointSize: 9
-                                                color: root.colSub
-                                                Layout.maximumWidth: messageListView.width * 0.7
-                                            }
-
-                                            // Voice note / audio message. The
-                                            // Repeater aliases modelData (its
-                                            // own modelData is the bar index),
-                                            // so everything inside reads audioMsg.
-                                            ColumnLayout {
-                                                id: msgAudio
-                                                property var audioMsg: modelData
-                                                visible: MsgUtils.isAudioMessage(modelData)
-                                                Layout.fillWidth: true
-                                                Layout.maximumWidth: messageListView.width * 0.7
-                                                spacing: 4
-
-                                                Component.onCompleted: { if (visible) root.requestAudio(audioMsg); }
-                                                onVisibleChanged: { if (visible) root.requestAudio(audioMsg); }
-
-                                                RowLayout {
-                                                    spacing: 8
-                                                    Layout.fillWidth: true
-
-                                                    Rectangle {
-                                                        width: 36; height: 36; radius: 18
-                                                        color: root.colAccent
-                                                        Text {
-                                                            anchors.centerIn: parent
-                                                            text: String(root.audioPlayingMsgId) === String(msgAudio.audioMsg.id) && root.audioIsPlaying ? "❚❚" : "▶"
-                                                            color: "#ffffff"
-                                                            font.pointSize: 12
-                                                        }
-                                                        MouseArea {
-                                                            anchors.fill: parent
-                                                            onClicked: root.toggleAudioPlayback(msgAudio.audioMsg)
-                                                        }
-                                                    }
-
-                                                    ColumnLayout {
-                                                        Layout.fillWidth: true
-                                                        spacing: 2
-
-                                                        Item {
-                                                            id: waveRow
-                                                            Layout.fillWidth: true
-                                                            Layout.preferredHeight: 30
-                                                            property int barCount: (msgAudio.audioMsg.waveform && msgAudio.audioMsg.waveform.length) || 0
-                                                            property real playedFrac: {
-                                                                if (String(root.audioPlayingMsgId) !== String(msgAudio.audioMsg.id)) return 0;
-                                                                var d = audioPlayer.duration || 0;
-                                                                if (d <= 0) return 0;
-                                                                return Math.min(1, Math.max(0, root.audioPositionMs / d));
-                                                            }
-                                                            Row {
-                                                                anchors.fill: parent
-                                                                spacing: 1
-                                                                Repeater {
-                                                                    model: waveRow.barCount
-                                                                    Rectangle {
-                                                                        width: Math.max(1, (waveRow.width - Math.max(0, waveRow.barCount - 1)) / Math.max(1, waveRow.barCount))
-                                                                        height: {
-                                                                            var v = (msgAudio.audioMsg.waveform && msgAudio.audioMsg.waveform[index]) || 0;
-                                                                            return 4 + (Math.min(100, Math.max(0, v)) / 100) * (waveRow.height - 4);
-                                                                        }
-                                                                        y: (waveRow.height - height) / 2
-                                                                        color: (index / Math.max(1, waveRow.barCount)) < waveRow.playedFrac ? root.colAccent : root.colSub
-                                                                    }
-                                                                }
-                                                            }
-                                                            MouseArea {
-                                                                anchors.fill: parent
-                                                                onClicked: function(mouse) {
-                                                                    if (waveRow.width > 0) root.seekAudioFraction(mouse.x / waveRow.width, msgAudio.audioMsg.id);
-                                                                }
-                                                                onPositionChanged: function(mouse) {
-                                                                    if (pressed && waveRow.width > 0) root.seekAudioFraction(mouse.x / waveRow.width, msgAudio.audioMsg.id);
-                                                                }
-                                                            }
-                                                        }
-
-                                                        RowLayout {
-                                                            spacing: 6
-                                                            PlasmaComponents.Label {
-                                                                id: audioTimeLabel
-                                                                text: {
-                                                                    var total = MsgUtils.audioDuration(msgAudio.audioMsg);
-                                                                    if (String(root.audioPlayingMsgId) === String(msgAudio.audioMsg.id)) {
-                                                                        if (total <= 0 && audioPlayer.duration > 0) total = Math.round(audioPlayer.duration / 1000);
-                                                                        var pos = Math.floor(root.audioPositionMs / 1000);
-                                                                        if (root.audioIsPlaying || pos > 0) return MsgUtils.formatDuration(pos) + " / " + MsgUtils.formatDuration(total);
-                                                                    }
-                                                                    return MsgUtils.formatDuration(total);
-                                                                }
-                                                                font.pointSize: 7.5
-                                                                color: root.colSub
-                                                            }
-                                                            Item { Layout.fillWidth: true; width: 1 }
-                                                            PlasmaComponents.Label {
-                                                                text: root.audioSpeedLabel()
-                                                                font.pointSize: 7.5
-                                                                font.bold: true
-                                                                color: root.colAccent
-                                                                MouseArea {
-                                                                    anchors.fill: parent
-                                                                    onClicked: root.cycleAudioSpeed()
-                                                                }
-                                                            }
-                                                            PlasmaComponents.Label {
-                                                                text: "⧉"
-                                                                font.pointSize: 9
-                                                                color: root.colSub
-                                                                MouseArea {
-                                                                    anchors.fill: parent
-                                                                    onClicked: root.openExternallyMsg(msgAudio.audioMsg)
-                                                                }
-                                                            }
-                                                        }
-
-                                                        PlasmaComponents.Label {
-                                                            visible: String(root.audioErrorMsgId) === String(msgAudio.audioMsg.id) && root.audioError !== ""
-                                                            text: root.audioError
-                                                            font.pointSize: 7.5
-                                                            color: "#e06666"
-                                                            wrapMode: Text.Wrap
-                                                            Layout.fillWidth: true
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // Caption of a photo/video/sticker,
-                                            // rendered under the media like
-                                            // WhatsApp does. The bubble scales
-                                            // with it (see msgBubble.width).
-                                            PlasmaComponents.Label {
-                                                id: msgCaption
-                                                visible: msgDelegateRoot.mediaCaption !== ""
-                                                text: msgDelegateRoot.mediaCaption
-                                                color: root.colText
-                                                font.pointSize: 9.5
-                                                font.family: root.emojiFont
-                                                wrapMode: Text.Wrap
-                                                Layout.fillWidth: true
-                                                renderType: Text.QtRendering
-                                            }
-
-                                            PlasmaComponents.Label {
-                                                id: msgTime
-                                                text: root.formatTime(modelData.t)
-                                                font.pointSize: 7
-                                                color: root.colSub
-                                                Layout.alignment: Qt.AlignRight
-                                            }
-                                        }
-
-                                        // Reaction button (small emoji icon at bottom-right)
-                                        Rectangle {
-                                            id: reactionButton
-                                            anchors { bottom: parent.bottom; right: parent.right; bottomMargin: -8; rightMargin: -4 }
-                                            width: 22; height: 22; radius: 11
-                                            color: root.colSurface
-                                            border.color: root.colBorder
-                                            border.width: 1
-                                            z: 10
-
-                                            Text {
-                                                anchors.centerIn: parent
-                                                text: "😊"
-                                                font.pointSize: 10
-                                                font.family: root.emojiFont
-                                                renderType: Text.QtRendering
-                                            }
-
-                                            MouseArea {
-                                                anchors.fill: parent
-                                                onClicked: {
-                                                    root.activeReactionMsgId = modelData.id || "";
-                                                    root.emojiPickerVisible = true;
-                                                }
-                                            }
-
-                                            // Only show when the message delegate list is interactive
-                                            // (hides when the emoji picker is open over it)
-                                            visible: !root.emojiPickerVisible
-                                        }
-                                    }
-
-                                    Item {
-                                        Layout.fillWidth: true
-                                    }
-
-                                    Item { width: 6 }
-                                }
-
-                                // ── Reactions display row ─────────────────────────────
-                                RowLayout {
-                                    id: reactionsRow
-                                    property string parentMsgId: modelData.id || ""
-                                    Layout.leftMargin: modelData.fromMe ? 50 : 14
-                                    Layout.rightMargin: modelData.fromMe ? 14 : 50
-                                    spacing: 4
-                                    visible: modelData.reactions && modelData.reactions.length > 0
-
-                                    Repeater {
-                                        model: MsgUtils.aggregateReactions(modelData.reactions)
-                                        Rectangle {
-                                            id: reactChip
-                                            height: 22
-                                            width: reactContentRow.implicitWidth + 12
-                                            radius: 11
-                                            color: modelData.fromMe ? root.colAccentDim : (chipMouse.containsMouse ? root.colBorder : root.colPanel)
-                                            border.color: modelData.fromMe ? root.colAccent : root.colBorder
-                                            border.width: 1
-
-                                            Behavior on color { ColorAnimation { duration: 100 } }
-
-                                            RowLayout {
-                                                id: reactContentRow
-                                                anchors.centerIn: parent
-                                                spacing: 3
-
-                                                Text {
-                                                    text: modelData.emoji || ""
-                                                    font.pointSize: 10
-                                                    font.family: root.emojiFont
-                                                    renderType: Text.QtRendering
-                                                }
-
-                                                PlasmaComponents.Label {
-                                                    visible: modelData.count > 1
-                                                    text: modelData.count
-                                                    font.pointSize: 7.5
-                                                    font.bold: true
-                                                    color: root.colText
-                                                }
-                                            }
-
-                                            PlasmaComponents.ToolTip.visible: chipMouse.containsMouse && modelData.senders && modelData.senders.length > 0
-                                            PlasmaComponents.ToolTip.text: modelData.senders ? modelData.senders.join(", ") : ""
-
-                                            MouseArea {
-                                                id: chipMouse
-                                                anchors.fill: parent
-                                                hoverEnabled: true
-                                                onClicked: {
-                                                    if (root.activeChat && reactionsRow.parentMsgId) {
-                                                        root.sendReaction(root.activeChat.id, reactionsRow.parentMsgId, modelData.emoji, modelData.fromMe);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Item { Layout.fillWidth: true }
-                                }
-                            }
-                        }
-                    }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Quick-reply chips ──────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 42
-                    color: root.colSurface
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-                        spacing: 6
-
-                        Repeater {
-                            model: ["👍 OK", "😊 Thanks", "On my way!", "Running late", "Call me?"]
-
-                            Rectangle {
-                                height: 26
-                                width: chipLabel.implicitWidth + 16
-                                radius: 13
-                                color: chipMouse.containsMouse ? root.colAccentDim : root.colPanel
-                                border.color: root.colBorder
-                                border.width: 1
-
-                                Behavior on color { ColorAnimation { duration: 120 } }
-
-                                PlasmaComponents.Label {
-                                    id: chipLabel
-                                    anchors.centerIn: parent
-                                    text: modelData
-                                    font.pointSize: 8
-                                    color: root.colText
-                                }
-
-                                MouseArea {
-                                    id: chipMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        var snippet = modelData.replace(/^[^\s]+\s/, ""); // strip emoji prefix
-                                        if (modelData.charAt(0) === "👍" || modelData.charAt(0) === "😊")
-                                            messageInput.text += modelData.split(" ")[0] + " ";
-                                        else
-                                            messageInput.text += modelData + " ";
-                                        messageInput.forceActiveFocus();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                // ── Message Input area ─────────────────────────
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: (root.pendingReplyId !== "" || root.pendingAttachmentPath !== "") ? 92 : 70
-                    color: root.colHeader
-
-
-                    ColumnLayout {
-                        anchors { fill: parent; leftMargin: 10; rightMargin: 10; topMargin: 8; bottomMargin: 8 }
-                        spacing: 4
-
-                        // ── "Replying to…" quote bar ──────────────────────────
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            visible: root.pendingReplyId !== ""
-
-                            Rectangle {
-                                width: 3; height: 30; radius: 1.5
-                                color: root.colAccent
-                            }
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 0
-
-                                PlasmaComponents.Label {
-                                    text: "Replying to"
-                                    font.pointSize: 7
-                                    font.bold: true
-                                    color: root.colAccent
-                                }
-                                PlasmaComponents.Label {
-                                    text: root.replyPreviewLabel
-                                    font.pointSize: 8
-                                    color: root.colSub
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                }
-                            }
-
-                            PlasmaComponents.ToolButton {
-                                Layout.preferredWidth: 24
-                                Layout.preferredHeight: 24
-                                text: "✕"
-                                ToolTip.text: "Cancel reply"
-                                ToolTip.visible: hovered
-                                onClicked: root.clearPendingReply()
-                            }
-                        }
-
-                        // ── Pasted-image draft chip (not sent until send is pressed) ──
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            visible: root.pendingAttachmentPath !== ""
-
-                            Rectangle {
-                                width: 3; height: 26; radius: 1.5
-                                color: root.colAccent
-                            }
-
-                            PlasmaComponents.Label {
-                                Layout.fillWidth: true
-                                text: "📷 Image attached — press send to deliver"
-                                font.pointSize: 8
-                                color: root.colText
-                                elide: Text.ElideRight
-                            }
-
-                            PlasmaComponents.ToolButton {
-                                Layout.preferredWidth: 24
-                                Layout.preferredHeight: 24
-                                text: "✕"
-                                ToolTip.text: "Remove attachment"
-                                ToolTip.visible: hovered
-                                onClicked: root.clearPendingAttachment()
-                            }
-                        }
-
-                        // Voice-note bar: recording timer or draft
-                        // confirm. Replaces nothing — it stacks above the
-                        // message row while active.
-                        Rectangle {
-                            visible: root.voiceState !== "" || root.voiceError !== ""
-                            Layout.fillWidth: true
-                            height: visible ? 40 : 0
-                            color: root.colPanel
-                            radius: 8
-                            border.color: root.voiceState === "recording" ? "#c0392b" : root.colBorder
-                            border.width: 1
-
-                            RowLayout {
-                                anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
-                                spacing: 8
-
-                                Rectangle {
-                                    id: recDot
-                                    width: 10; height: 10; radius: 5
-                                    color: "#e74c3c"
-                                    visible: root.voiceState === "recording"
-                                }
-
-                                PlasmaComponents.Label {
-                                    text: {
-                                        if (root.voiceError !== "") return root.voiceError;
-                                        if (root.voiceState === "recording") return "Recording " + MsgUtils.formatDuration(root.voiceSecs);
-                                        if (root.voiceState === "draft") return "Voice note " + MsgUtils.formatDuration(root.voiceSecs);
-                                        return "";
-                                    }
-                                    font.pointSize: 9
-                                    font.bold: root.voiceState === "recording"
-                                    color: root.voiceError !== "" ? "#e06666" : root.colText
-                                    Layout.fillWidth: true
-                                    elide: Text.ElideRight
-                                }
-
-                                PlasmaComponents.ToolButton {
-                                    visible: root.voiceState === "draft"
-                                    icon.name: "media-playback-start"
-                                    display: PlasmaComponents.ToolButton.IconOnly
-                                    ToolTip.text: "Play draft"
-                                    ToolTip.visible: hovered
-                                    onClicked: root.playVoiceDraft()
-                                }
-
-                                PlasmaComponents.ToolButton {
-                                    visible: root.voiceState !== ""
-                                    icon.name: "edit-delete"
-                                    display: PlasmaComponents.ToolButton.IconOnly
-                                    ToolTip.text: "Discard"
-                                    ToolTip.visible: hovered
-                                    onClicked: root.discardVoiceNote()
-                                }
-
-                                Rectangle {
-                                    visible: root.voiceState === "draft"
-                                    width: 36; height: 36; radius: 18
-                                    color: root.colAccent
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: "➤"
-                                        color: "#ffffff"
-                                        font.pointSize: 12
-                                    }
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        onClicked: root.sendVoiceNote()
-                                    }
-                                }
-                            }
-                        }
-
-                        RowLayout {
-                            spacing: 8
-                            Layout.fillWidth: true
-
-                            // Emoji button
-                            PlasmaComponents.ToolButton {
-                                id: emojiButton
-                                width: 36; height: 36
-                                icon.name: "face-smile"
-                                display: PlasmaComponents.ToolButton.IconOnly
-                                ToolTip.text: "Emojis"
-                                ToolTip.visible: hovered
-                                onClicked: {
-                                    if (root.emojiPickerVisible && root.activeReactionMsgId === "") {
-                                        root.emojiPickerVisible = false;
-                                    } else {
-                                        root.activeReactionMsgId = "";
-                                        root.emojiPickerVisible = true;
-                                    }
-                                }
-                            }
-
-                            // Attach button
-                            PlasmaComponents.ToolButton {
-                                id: attachButton
-                                width: 36; height: 36
-                                icon.name: "mail-attachment"
-                                display: PlasmaComponents.ToolButton.IconOnly
-                                ToolTip.text: "Send file"
-                                ToolTip.visible: hovered
-                                onClicked: fileDialog.open()
-                            }
-
-                            // Voice-note button: same circular language as
-                            // the bubble play button; red only while recording.
-                            Rectangle {
-                                id: micButton
-                                width: 36; height: 36; radius: 18
-                                color: root.voiceState === "recording" ? "#c0392b" : root.colPanel
-                                border.color: root.colBorder
-                                border.width: 1
-                                opacity: !root.activeChat ? 0.4 : 1.0
-                                Behavior on color { ColorAnimation { duration: 150 } }
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: root.voiceState === "recording" ? "■" : "🎙"
-                                    font.pointSize: root.voiceState === "recording" ? 11 : 15
-                                }
-                                ToolTip.text: root.voiceState === "recording" ? "Stop recording" : "Record voice note"
-                                ToolTip.visible: micMouse.containsMouse
-                                MouseArea {
-                                    id: micMouse
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: root.toggleVoiceNote()
-                                }
-                            }
-
-                            // Input text box
-                            Rectangle {
-                                Layout.fillWidth: true
-                                height: 36
-                                color: root.colPanel
-                                border.color: messageInput.activeFocus ? root.colAccent : root.colBorder
-                                border.width: messageInput.activeFocus ? 1.5 : 1
-                                radius: 18
-
-                                RowLayout {
-                                    anchors.fill: parent
-                                    anchors.leftMargin: 12
-                                    anchors.rightMargin: 12
-                                    spacing: 6
-
-                                    Flickable {
-                                        id: flick
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                        clip: true
-                                        contentWidth: width
-                                        contentHeight: messageInput.implicitHeight
-                                        flickableDirection: Flickable.VerticalFlick
-                                        boundsBehavior: Flickable.StopAtBounds
-
-                                        // Helper: keep the cursor rectangle visible
-                                        function ensureCursorVisible() {
-                                            var r = messageInput.cursorRectangle;
-                                            // Vertical
-                                            if (r.y < flick.contentY)
-                                                flick.contentY = r.y;
-                                            else if (r.y + r.height > flick.contentY + flick.height)
-                                                flick.contentY = r.y + r.height - flick.height;
-                                        }
-
-                                        TextEdit {
-                                            id: messageInput
-                                            Component.onCompleted: root.messageInputRef = messageInput
-                                            width: flick.width
-                                            wrapMode: TextEdit.Wrap
-                                            color: root.colText
-                                            font.pointSize: 9.5
-                                            font.family: root.emojiFont
-                                            selectionColor: root.colAccent
-                                            focus: true
-
-                                            // Auto-scroll the Flickable whenever the cursor moves
-                                            onCursorRectangleChanged: flick.ensureCursorVisible()
-
-                                            Text {
-                                                anchors.fill: parent
-                                                text: "Type a message…"
-                                                color: root.colSub
-                                                font: parent.font
-                                                visible: parent.text.length === 0
-                                            }
-
-                                            Keys.onReturnPressed: function(event) {
-                                                event.accepted = true;
-                                                if (event.modifiers & Qt.ShiftModifier) {
-                                                    messageInput.insert(messageInput.cursorPosition, "\n");
-                                                } else {
-                                                    sendComposed();
-                                                }
-                                            }
-
-
-                                            Keys.onPressed: function(event) {
-                                                if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
-                                                    if (event.modifiers & Qt.ShiftModifier) {
-                                                        event.accepted = true;
-                                                        pasteImageFromClipboard();
-                                                    } else {
-                                                        var hadSelection = messageInput.selectedText.length > 0;
-                                                        var oldLen = messageInput.text.length;
-                                                        messageInput.paste();
-                                                        if (!hadSelection && messageInput.text.length === oldLen) {
-                                                            // No text was inserted by Qt paste, check if clipboard contains an image
-                                                            pasteImageFromClipboard();
-                                                        }
-                                                        event.accepted = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Send button (always visible, dimmed when no text)
-                            Rectangle {
-                                width: 36; height: 36
-                                radius: 18
-                                color: {
-                                    if (sendMouseArea.containsMouse && (messageInput.text.trim().length > 0 || root.pendingAttachmentPath !== "") && !root.sendInFlight) return root.colAccentDim;
-                                    return root.colAccent;
-                                }
-                                opacity: ((messageInput.text.trim().length === 0 && root.pendingAttachmentPath === "") || root.sendInFlight) ? 0.5 : 1.0
-
-                                Behavior on color { ColorAnimation { duration: 150 } }
-
-                                PlasmaComponents.Label {
-                                    anchors.centerIn: parent
-                                    text: root.sendInFlight ? "⏳" : "➤"
-                                    color: "#ffffff"
-                                    font.pointSize: 12
-                                }
-
-                                MouseArea {
-                                    id: sendMouseArea
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        sendComposed();
-                                    }
-                                }
-                            }
-                        }
-
-                        // Hint text
-                        PlasmaComponents.Label {
-                            text: "Shift+Enter for new line"
-                            font.pointSize: 7
-                            color: root.colSub
-                            Layout.alignment: Qt.AlignHCenter
-                        }
-                    }
-                }
+            // ── Page 2: message history + compose (MessagesPanel.qml) ─────────
+            MessagesPanel {
+                rootItem: root
+                audioPlayerRef: audioPlayer
             }
         }
 
-        // ── Emoji Picker Overlay ─────────────────────────────────────────────
-        Rectangle {
-            visible: root.emojiPickerVisible
+        // ── Emoji Picker Overlay (EmojiPickerOverlay.qml) ──────────────────
+        EmojiPickerOverlay {
             anchors.fill: parent
-            color: "#00000000"
-
-            // Tap outside to dismiss
-            MouseArea {
-                anchors.fill: parent
-                onClicked: {
-                    root.emojiPickerVisible = false;
-                    root.activeReactionMsgId = "";
-                }
-            }
-
-            Rectangle {
-                anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
-                height: 200
-                color: root.colPanel
-                border.color: root.colBorder
-                border.width: 1
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 0
-
-                    // Quick reaction row
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 50
-                        color: root.colHeader
-
-                        RowLayout {
-                            anchors.centerIn: parent
-                            spacing: 8
-
-                            Repeater {
-                                model: ["👍", "❤️", "😂", "😮", "😢", "🙏"]
-                                Rectangle {
-                                    width: 36; height: 36; radius: 18
-                                    color: emojiHover.containsMouse ? root.colAccentDim : root.colSurface
-                                    border.color: root.colBorder
-                                    border.width: 1
-
-                                    Behavior on color { ColorAnimation { duration: 100 } }
-
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData
-                                        font.pointSize: 18
-                                        font.family: root.emojiFont
-                                        renderType: Text.QtRendering
-                                    }
-
-                                    MouseArea {
-                                        id: emojiHover
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onClicked: {
-                                            if (root.activeReactionMsgId && root.activeChat) {
-                                                root.sendReaction(root.activeChat.id, root.activeReactionMsgId, modelData);
-                                            } else if (!root.activeReactionMsgId) {
-                                                // Insert mode - add emoji to message text
-                                                messageInput.text += modelData;
-                                                messageInput.forceActiveFocus();
-                                            }
-                                            root.emojiPickerVisible = false;
-                                            root.activeReactionMsgId = "";
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Category Tabs Bar
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 32
-                        color: root.colSurface
-
-                        RowLayout {
-                            anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-                            spacing: 2
-
-                            Repeater {
-                                model: ["⭐", "😀", "👋", "🐶", "🍎", "🚗", "⚽", "💡"]
-                                Rectangle {
-                                    height: 26
-                                    width: 32
-                                    radius: 4
-                                    color: index === root.selectedEmojiCategory ? root.colAccentDim : (catHover.containsMouse ? root.colPanel : "transparent")
-                                    border.color: index === root.selectedEmojiCategory ? root.colAccent : "transparent"
-                                    border.width: 1
-
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData
-                                        font.pointSize: 12
-                                        font.family: root.emojiFont
-                                        renderType: Text.QtRendering
-                                    }
-
-                                    MouseArea {
-                                        id: catHover
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onClicked: root.selectedEmojiCategory = index
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Rectangle { Layout.fillWidth: true; height: 1; color: root.colBorder }
-
-                    // Scrolling vertical emoji grid
-                    PlasmaComponents.ScrollView {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-
-                        GridView {
-                            id: emojiGrid
-                            anchors.fill: parent
-                            anchors.margins: 4
-                            cellWidth: 38
-                            cellHeight: 38
-                            flow: GridView.FlowLeftToRight
-                            clip: true
-
-                            model: {
-                                if (root.selectedEmojiCategory === 0) return root.emojiList;
-                                if (root.selectedEmojiCategory === 1) return root.emojiList.slice(0, 80);
-                                if (root.selectedEmojiCategory === 2) return root.emojiList.slice(80, 160);
-                                if (root.selectedEmojiCategory === 3) return root.emojiList.slice(220, 310);
-                                if (root.selectedEmojiCategory === 4) return root.emojiList.slice(310, 410);
-                                if (root.selectedEmojiCategory === 5) return root.emojiList.slice(410, 500);
-                                if (root.selectedEmojiCategory === 6) return root.emojiList.slice(500, 563);
-                                if (root.selectedEmojiCategory === 7) return root.emojiList.slice(563);
-                                return root.emojiList;
-                            }
-
-                            delegate: Rectangle {
-                                width: 36; height: 36
-                                color: emojiItemHover.containsMouse ? root.colAccentDim : "transparent"
-                                radius: 4
-
-                                Behavior on color { ColorAnimation { duration: 80 } }
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: modelData
-                                    font.pointSize: 16
-                                    font.family: root.emojiFont
-                                    renderType: Text.QtRendering
-                                }
-
-                                MouseArea {
-                                    id: emojiItemHover
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onClicked: {
-                                        if (root.activeReactionMsgId && root.activeChat) {
-                                            root.sendReaction(root.activeChat.id, root.activeReactionMsgId, modelData);
-                                        } else if (!root.activeReactionMsgId) {
-                                            // Insert mode - add emoji to message text
-                                            messageInput.text += modelData;
-                                            messageInput.forceActiveFocus();
-                                        }
-                                        root.emojiPickerVisible = false;
-                                        root.activeReactionMsgId = "";
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            rootItem: root
         }
+
     }
-    // ── Fullscreen media viewer (Slice 4) ────────────────────────────────────
+    // ── Fullscreen media viewer (MediaViewerOverlay.qml) ────────────────────
     // Pinch-zoom/pan for images and stickers with prev/next navigation.
     // NOTE: QtMultimedia is not available in this plasmoid sandbox (Slice 0
     // spike), so video messages render their base64 preview enlarged with an
     // "open on phone" note instead of inline playback.
-    Rectangle {
-        id: mediaViewer
-        objectName: "mediaViewer"
+    MediaViewerOverlay {
         anchors.fill: parent
-        z: 100
-        visible: root.viewerVisible
-        color: "#000000"
-        focus: visible
-        Keys.onEscapePressed: root.closeMediaViewer()
-        Keys.onLeftPressed: root.viewerStep(-1)
-        Keys.onRightPressed: root.viewerStep(1)
-
-        function currentMsg() {
-            if (!root.mediaList || root.mediaList.length === 0) return null;
-            var i = Math.max(0, Math.min(root.mediaIndex, root.mediaList.length - 1));
-            return root.mediaList[i];
-        }
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
-
-            // Header: counter + close
-            Rectangle {
-                Layout.fillWidth: true
-                height: 44
-                color: "#cc000000"
-
-                RowLayout {
-                    anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
-                    spacing: 8
-
-                    PlasmaComponents.Label {
-                        text: root.mediaList.length > 0
-                              ? (Math.min(root.mediaIndex, root.mediaList.length - 1) + 1) + " of " + root.mediaList.length
-                              : ""
-                        color: "#ffffff"
-                        font.pointSize: 9
-                        Layout.fillWidth: true
-                    }
-
-                    PlasmaComponents.ToolButton {
-                        icon.name: "dialog-close"
-                        display: PlasmaComponents.ToolButton.IconOnly
-                        onClicked: root.closeMediaViewer()
-                    }
-                }
-            }
-
-            // Stage: pinch-zoom + drag-pan; click closes, double-click resets,
-            // drag down dismisses.
-            Item {
-                id: viewerStage
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                property real vScale: 1.0
-                property real vTx: 0
-                property real vTy: 0
-                function reset() { vScale = 1.0; vTx = 0; vTy = 0; }
-
-                Image {
-                    id: viewerImage
-                    anchors.centerIn: parent
-                    source: {
-                        var m = mediaViewer.currentMsg();
-                        if (!m) return "";
-                        if (root.viewerFullMsgId !== "" && root.viewerFullMsgId === m.id && root.viewerFullSource !== "")
-                            return root.viewerFullSource;
-                        return MsgUtils.mediaPreviewSource(m);
-                    }
-                    fillMode: Image.PreserveAspectFit
-                    scale: viewerStage.vScale
-                    transform: Translate { x: viewerStage.vTx; y: viewerStage.vTy }
-                    asynchronous: true
-
-                    // Loading overlay while the full-res image arrives; the
-                    // cached 480p thumb stays painted underneath. On failure
-                    // the overlay names the problem instead of going blank.
-                    PlasmaComponents.Label {
-                        anchors.centerIn: parent
-                        visible: root.viewerFullLoading || root.viewerFullFailed
-                        text: root.viewerFullFailed ? "Couldn't load full image" : "Loading full resolution…"
-                        color: "#ffffff"
-                        font.pointSize: 9
-                        style: Text.Outline
-                        styleColor: "#80000000"
-                        z: 5
-                    }
-
-                    PlasmaComponents.Label {
-                        anchors.centerIn: parent
-                        visible: {
-                            var m = mediaViewer.currentMsg();
-                            return !!m && m.type === "video";
-                        }
-                        text: "🎥 Video — open on phone to play"
-                        color: "#ffffff"
-                        font.pointSize: 9
-                        style: Text.Outline
-                        styleColor: "#80000000"
-                    }
-                }
-
-                PinchArea {
-                    anchors.fill: parent
-                    onPinchUpdated: {
-                        viewerStage.vScale = Math.min(4, Math.max(0.5, viewerStage.vScale * pinch.scale));
-                    }
-                    MouseArea {
-                        id: viewerPan
-                        anchors.fill: parent
-                        property real lastX: 0
-                        property real lastY: 0
-                        property real startY: 0
-                        property bool moved: false
-                        onPressed: function(mouse) {
-                            lastX = mouse.x; lastY = mouse.y; startY = mouse.y; moved = false;
-                        }
-                        onPositionChanged: function(mouse) {
-                            var dx = mouse.x - lastX;
-                            var dy = mouse.y - lastY;
-                            if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
-                            if (viewerStage.vScale > 1.05) {
-                                viewerStage.vTx += dx;
-                                viewerStage.vTy += dy;
-                            } else if (dy > 0 && mouse.y - startY > 80) {
-                                root.closeMediaViewer();   // swipe-down dismiss
-                            }
-                            lastX = mouse.x; lastY = mouse.y;
-                        }
-                        onClicked: if (!moved) root.closeMediaViewer()
-                        onDoubleClicked: viewerStage.reset()
-                    }
-                }
-            }
-
-                // Footer: prev / next + media label
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 52
-                    color: "#cc000000"
-
-                    RowLayout {
-                        anchors { fill: parent; leftMargin: 16; rightMargin: 16 }
-                        spacing: 12
-
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-previous"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            visible: root.mediaList.length > 1
-                            onClicked: root.viewerStep(-1)
-                        }
-                        Item { Layout.fillWidth: true }
-                        PlasmaComponents.Label {
-                            text: {
-                                var m = mediaViewer.currentMsg();
-                                return m ? (MsgUtils.mediaLabel(m.type) || "📷 Media") : "";
-                            }
-                            color: "#ffffff"
-                            font.pointSize: 9
-                        }
-                        PlasmaComponents.ToolButton {
-                            icon.name: "window-new"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            ToolTip.text: "Open in system viewer"
-                            ToolTip.visible: hovered
-                            onClicked: root.openExternallyCurrent()
-                        }
-                        Item { Layout.fillWidth: true }
-                        PlasmaComponents.ToolButton {
-                            icon.name: "go-next"
-                            display: PlasmaComponents.ToolButton.IconOnly
-                            visible: root.mediaList.length > 1
-                            onClicked: root.viewerStep(1)
-                        }
-                    }
-                }
-        }
-
-        onVisibleChanged: {
-            if (visible) {
-                viewerStage.reset();
-                mediaViewer.forceActiveFocus();
-            }
-        }
+        rootItem: root
     }
 
     // Hidden clipboard helper (ContextMenuButtons.qml). Exposed as a property so
@@ -3942,7 +2301,7 @@ PlasmoidItem {
     readonly property alias contextMenuButtons: clipboardHelper
     ContextMenuButtons {
         id: clipboardHelper
-        root: root
+        rootItem: root
     }
 
     // Right-click context menus (Menus.qml). Exposed as a property so delegate code
@@ -3950,8 +2309,14 @@ PlasmoidItem {
     readonly property alias menus: menusObj
     Menus {
         id: menusObj
-        root: root
+        rootItem: root
     }
+
+    // NOTE: fullRepresentation is Component-typed, so ids inside it are NOT
+    // visible to root-level `property alias` (engine: "Unable to find id").
+    // Same-tree code reaches the compose bar as `sendBar.*` (the instance
+    // lives in MessagesPanel.qml); root-level code talks to it through root
+    // state (see recDotLit, messageInputRef).
 
     // "Copied" toast
     Timer {

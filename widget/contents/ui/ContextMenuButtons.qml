@@ -8,7 +8,9 @@ import org.kde.plasma.plasmoid
 
 Item {
     id: contextMenuButtons
-    required property PlasmoidItem root
+    // Named rootItem (not root): `rootItem: root` at the instance site must
+    // not self-resolve — a property named `root` would shadow the outer id.
+    required property PlasmoidItem rootItem
 
     readonly property alias clipEdit: clipTextEdit
 

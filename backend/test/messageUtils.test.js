@@ -228,3 +228,77 @@ test('systemMessageText returns empty string for normal messages', () => {
     assert.equal(utils.systemMessageText({ type: 'ptt', body: '' }), '');
     assert.equal(utils.systemMessageText(null), '');
 });
+
+// ── filterChats (archived-chat view) ─────────────────────────────────────────
+
+test('filterChats hides archived chats by default', () => {
+    const chats = [
+        { id: '123@s.whatsapp.net', name: 'Johnny', t: 100 },
+        { id: '456@s.whatsapp.net', name: 'Alice', t: 200 },
+        { id: '789@g.us', name: 'Team', t: 300, isArchived: true }, // stale flag must be ignored
+    ];
+    const out = utils.filterChats(chats, '', ['123@s.whatsapp.net'], false);
+    assert.deepEqual(out.map(c => c.id), ['456@s.whatsapp.net', '789@g.us']);
+});
+
+test('filterChats with showArchived shows only archived chats', () => {
+    const chats = [
+        { id: '123@s.whatsapp.net', name: 'Johnny', t: 100 },
+        { id: '456@s.whatsapp.net', name: 'Alice', t: 200 },
+    ];
+    const out = utils.filterChats(chats, '', ['123@s.whatsapp.net'], true);
+    assert.deepEqual(out.map(c => c.id), ['123@s.whatsapp.net']);
+});
+
+test('filterChats search applies within the current view', () => {
+    const chats = [
+        { id: '123@s.whatsapp.net', name: 'Johnny', t: 100 },
+        { id: '456@s.whatsapp.net', name: 'Johnny Two', t: 200 },
+        { id: '789@s.whatsapp.net', name: 'Alice', t: 300 },
+    ];
+    const archived = ['123@s.whatsapp.net'];
+    // Archived view: only archived Johnnys match "johnny".
+    assert.deepEqual(
+        utils.filterChats(chats, 'johnny', archived, true).map(c => c.id),
+        ['123@s.whatsapp.net']);
+    // Main view: only non-archived Johnnys match.
+    assert.deepEqual(
+        utils.filterChats(chats, 'johnny', archived, false).map(c => c.id),
+        ['456@s.whatsapp.net']);
+});
+
+test('filterChats matches display name and the phone portion of the id', () => {
+    const chats = [
+        { id: '254711222333@s.whatsapp.net', name: 'K', t: 100 },
+        { id: '999-888@g.us', name: 'Wednesday Team', t: 200 },
+    ];
+    assert.deepEqual(
+        utils.filterChats(chats, '2547112', [], false).map(c => c.id),
+        ['254711222333@s.whatsapp.net']);
+    assert.deepEqual(
+        utils.filterChats(chats, '  wednesday ', [], false).map(c => c.id),
+        ['999-888@g.us']);
+    assert.deepEqual(
+        utils.filterChats(chats, 's.whatsapp.net', [], false).map(c => c.id),
+        []); // only matched text before '@' counts
+});
+
+test('filterChats ignores stale archived ids that match no chat', () => {
+    const chats = [
+        { id: '123@s.whatsapp.net', name: 'Johnny', t: 100 },
+        { id: '456@s.whatsapp.net', name: 'Alice', t: 200 },
+    ];
+    const out = utils.filterChats(chats, '', ['stale-removed@s.whatsapp.net', 'johnny'], false);
+    assert.deepEqual(out.map(c => c.id), ['123@s.whatsapp.net', '456@s.whatsapp.net']);
+});
+
+test('filterChats tolerates empty / null inputs and never mutates the list', () => {
+    assert.deepEqual(utils.filterChats(null, '', [], false), []);
+    assert.deepEqual(utils.filterChats([], '', null, true), []);
+    assert.deepEqual(utils.filterChats(undefined, null, undefined, false), []);
+    const chats = [{ id: '1@x', name: 'Solo', t: 1 }];
+    const out = utils.filterChats(chats, 'solo', null, false);
+    assert.deepEqual(out.map(c => c.id), ['1@x']);
+    assert.equal(chats.length, 1);      // input untouched
+    assert.notEqual(out, chats);        // fresh array returned
+});

@@ -217,6 +217,43 @@ function chatRecency(c) {
     return Math.max(t1, t2);
 }
 
+// Chat-list view filter shared by the widget: decides which chats are
+// visible in the current view. A chat is shown only when its archived state
+// matches `showArchived` — the normal view hides archived chats, the
+// archived view shows only them. `query` is trimmed/lowercased; empty keeps
+// all view-eligible chats, otherwise it matches the display name
+// (name || formattedTitle) or the phone portion of the id (text before '@').
+// Pure: null/non-array inputs tolerated, input never mutated, order kept.
+// Archived ids are matched as Strings so numeric/other types don't break;
+// stale ids that match no chat are harmless.
+function filterChats(chats, query, archivedIds, showArchived) {
+    var list = Array.isArray(chats) ? chats : [];
+    var ids = Array.isArray(archivedIds) ? archivedIds : [];
+    var byId = {};
+    for (var i = 0; i < ids.length; i++) {
+        if (ids[i] !== null && ids[i] !== undefined) byId[String(ids[i])] = true;
+    }
+    var q = String(query === null || query === undefined ? '' : query).trim().toLowerCase();
+    var out = [];
+    for (var j = 0; j < list.length; j++) {
+        var c = list[j];
+        if (!c || typeof c !== 'object') continue;
+        var cid = (c.id === null || c.id === undefined) ? '' : String(c.id);
+        // The archived-ids list is authoritative; per-chat object flags can
+        // be stale and would make unarchive a no-op.
+        var archived = cid !== '' && byId[cid] === true;
+        if (archived !== !!showArchived) continue;
+        if (q !== '') {
+            var name = String(c.name || c.formattedTitle || '').toLowerCase();
+            var phone = cid.split('@')[0].toLowerCase();
+            if (name.indexOf(q) === -1 && phone.indexOf(q) === -1) continue;
+        }
+        out.push(c);
+    }
+    return out;
+}
+
+
 // Chat list comparator: pinned first, then most recent activity, then name-asc
 // as a stable tiebreak. `isPinned` is an injectable resolver (QML passes
 // root.isChatPinned, which consults both chat.isPinned and the pins list).
@@ -314,6 +351,7 @@ if (typeof module !== 'undefined' && module.exports) {
         aggregateReactions: aggregateReactions,
         chatRecency: chatRecency,
         compareChats: compareChats,
+        filterChats: filterChats,
         thumbnailize: thumbnailize,
         mediaSource: mediaSource,
         mediaPreviewSource: mediaPreviewSource,
